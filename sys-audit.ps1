@@ -191,22 +191,57 @@ function Install-FirefoxExact($ver) {
     $url = "https://download.mozilla.org/?product=firefox-$ver&os=win64&lang=en-US"
     $exe = "$env:TEMP\firefox-$ver-setup.exe"
     $sw  = Get-Date
-    if (-not (Download-Fast $url $exe)) {
-        Say "               Download failed. Firefox $ver may not exist yet." Red
+
+    # Direct download (don't use Download-Fast's 50MB threshold - Firefox is ~95MB but let's be safe)
+    $dlOk = $false
+    try {
+        if (Test-Path $exe) { Remove-Item $exe -Force -ErrorAction SilentlyContinue }
+        Import-Module BitsTransfer -ErrorAction Stop
+        Start-BitsTransfer -Source $url -Destination $exe -Priority Foreground -ErrorAction Stop
+        if ((Test-Path $exe) -and (Get-Item $exe).Length -gt 10MB) { $dlOk = $true }
+    } catch {
+        Say "               BITS failed: $($_.Exception.Message)" DarkGray
+    }
+    if (-not $dlOk -and (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
+        & curl.exe -L --fail -o $exe $url 2>&1 | Out-Null
+        if ((Test-Path $exe) -and (Get-Item $exe).Length -gt 10MB) { $dlOk = $true }
+    }
+    if (-not $dlOk) {
+        try { Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing; $dlOk = $true } catch { }
+    }
+    if (-not $dlOk) {
+        Say "               Download failed. Check network/proxy." Red
         return
     }
+
     $mb   = "{0:N1}" -f ((Get-Item $exe).Length / 1MB)
     $secs = "{0:N1}" -f ((Get-Date) - $sw).TotalSeconds
     Say "               Downloaded $mb MB in ${secs}s" Green
+
     Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
-    try {
-        $p = Start-Process $exe -ArgumentList "/S" -Verb RunAs -Wait -PassThru -ErrorAction Stop
-        Say "               Firefox installer exit code: $($p.ExitCode)" DarkGray
-    } catch {
-        Say "               UAC denied or installer failed." Red
+
+    Say "               Installing Firefox $ver silently..." Yellow
+    # Write INI for unattended install (official Mozilla method, more reliable than /S alone)
+    $ini = "$env:TEMP\firefox-install.ini"
+    @'
+[Install]
+InstallDirectoryType=Default
+RemoveDistributionDir=true
+MaintenanceService=true
+'@ | Out-File -Encoding ascii $ini
+
+    # Already running elevated (auto-elevate block guarantees this), so NO -Verb RunAs
+    $p = Start-Process -FilePath $exe -ArgumentList "/INI=`"$ini`"" -Wait -PassThru -NoNewWindow -ErrorAction SilentlyContinue
+    if (-not $p -or $p.ExitCode -ne 0) {
+        # Fallback: NSIS /S silent switch
+        Say "               /INI method didn't finish - trying /S..." DarkGray
+        $p = Start-Process -FilePath $exe -ArgumentList "/S" -Wait -PassThru -NoNewWindow -ErrorAction SilentlyContinue
     }
+    if ($p) { Say "               Firefox installer exit code: $($p.ExitCode)" DarkGray }
+
     Remove-Item $exe -Force -ErrorAction SilentlyContinue
+    Remove-Item $ini -Force -ErrorAction SilentlyContinue
 }
 
 function Install-EdgeStableLatest {
@@ -311,6 +346,21 @@ if (-not $hasWinget) {
 
 for ($i = 0; $i -lt $Names.Count; $i++) {
     if (-not $Found[$i]) {
+        # If a target version is pinned and the tool isn't installed, offer to install it fresh (browsers only)
+        if ($Target[$i] -and $Detect[$i] -eq 'firefox') {
+            Say ("  [INSTALL]    {0,-18}  not found - installing version {1}..." -f $Names[$i], $Target[$i]) Yellow
+            Install-FirefoxExact $Target[$i]
+            Start-Sleep -Seconds 3
+            $after = Get-FirefoxVersion
+            if ($after.Installed) {
+                $Found[$i]  = $true
+                $NewVer[$i] = $after.Version
+                Say ("               Installed  ->  $($after.Version)") Green
+            } else {
+                Say ("               Install did not complete.") Red
+            }
+            continue
+        }
         Say ("  [SKIP]       {0,-18}  not installed - skipping" -f $Names[$i]) DarkGray
         continue
     }
