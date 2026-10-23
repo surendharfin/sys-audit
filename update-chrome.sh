@@ -45,7 +45,7 @@ say "Package manager: ${C}${PM}${N}"
 
 # --- Tools to audit: name|command|version-flag|package-name|target-version ---
 TOOLS=(
-    "Google Chrome|google-chrome|--version|google-chrome-stable|"
+    "Google Chrome|google-chrome|--version|google-chrome-beta|156.0.8078.48"
     "Mozilla Firefox|firefox|--version|firefox|"
     "Microsoft Edge|microsoft-edge|--version|microsoft-edge-stable|"
     "Node.js|node|--version|nodejs|26.12.1"
