@@ -431,21 +431,6 @@ if (-not $hasWinget) {
 
 for ($i = 0; $i -lt $Names.Count; $i++) {
     if (-not $Found[$i]) {
-        # If a target version is pinned and the tool isn't installed, offer to install it fresh (browsers only)
-        if ($Target[$i] -and $Detect[$i] -eq 'firefox') {
-            Say ("  [INSTALL]    {0,-18}  not found - installing version {1}..." -f $Names[$i], $Target[$i]) Yellow
-            Install-FirefoxExact $Target[$i]
-            Start-Sleep -Seconds 3
-            $after = Get-FirefoxVersion
-            if ($after.Installed) {
-                $Found[$i]  = $true
-                $NewVer[$i] = $after.Version
-                Say ("               Installed  ->  $($after.Version)") Green
-            } else {
-                Say ("               Install did not complete.") Red
-            }
-            continue
-        }
         Say ("  [SKIP]       {0,-18}  not installed - skipping" -f $Names[$i]) DarkGray
         continue
     }
