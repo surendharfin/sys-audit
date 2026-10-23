@@ -70,11 +70,17 @@ function Get-ExeVersion($paths) {
 }
 
 function Get-ChromeVersion {
-    $exe = Get-ExeVersion @(
+    # Check Stable first, then Beta, then Dev - whichever is newest wins
+    $candidates = @(
+        "$env:ProgramFiles\Google\Chrome Beta\Application\chrome.exe",
+        "${env:ProgramFiles(x86)}\Google\Chrome Beta\Application\chrome.exe",
+        "$env:ProgramFiles\Google\Chrome Dev\Application\chrome.exe",
+        "${env:ProgramFiles(x86)}\Google\Chrome Dev\Application\chrome.exe",
         "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
         "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
         "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
     )
+    $exe = Get-ExeVersion $candidates
     if (-not $exe.Installed) { return $exe }
     # Prefer the registry 'pv' value if newer (= update staged)
     $regPaths = @(
@@ -198,44 +204,42 @@ for ($i = 0; $i -lt $Names.Count; $i++) {
     switch ($Detect[$i]) {
         'chrome' {
             $t = $Target[$i]
-            if ($t -and $t.Split('.')[0] -ne $OldVer[$i].Split('.')[0]) {
-                # Different major -> pin via channel-specific MSI
-                $major = [int]$t.Split('.')[0]
+            # If a specific Chrome target is pinned, always use the channel-specific MSI
+            if ($t) {
+                $major = 0
+                $parts = $t.Split('.')
+                if ($parts.Count -gt 0) { $major = [int]$parts[0] }
+
                 if ($major -ge 157)      { $msiUrl = $ChromeDevMsi;    $channel = 'Dev'    }
                 elseif ($major -ge 156)  { $msiUrl = $ChromeBetaMsi;   $channel = 'Beta'   }
                 else                     { $msiUrl = $ChromeStableMsi; $channel = 'Stable' }
 
-                Say "               Target $t is on $channel channel; downloading MSI..." DarkGray
+                Say "               Target $t -> Chrome $channel channel MSI" DarkGray
                 $msi = Join-Path $env:TEMP "chrome-$channel.msi"
+                if (Test-Path $msi) { Remove-Item $msi -Force -ErrorAction SilentlyContinue }
+
                 $dlOk = $false
                 $sw = Get-Date
 
-                # Method 1: BITS (fastest - uses Microsoft's background transfer service, multi-connection, resumable)
+                # Method 1: BITS
                 try {
                     Import-Module BitsTransfer -ErrorAction Stop
-                    Say "               Using BITS transfer..." DarkGray
+                    Say "               Downloading via BITS..." DarkGray
                     Start-BitsTransfer -Source $msiUrl -Destination $msi -Priority Foreground -ErrorAction Stop
-                    if (Test-Path $msi) { $dlOk = $true }
+                    if ((Test-Path $msi) -and (Get-Item $msi).Length -gt 50MB) { $dlOk = $true }
                 } catch {
                     Say "               BITS failed: $($_.Exception.Message)" DarkGray
                 }
-
-                # Method 2: curl.exe with HTTP/2 and parallel connections
+                # Method 2: curl
                 if (-not $dlOk -and (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
-                    Say "               Using curl.exe..." DarkGray
-                    & curl.exe -L --http2 --tcp-fastopen --compressed --parallel-max 4 -o $msi $msiUrl 2>&1 | Out-Null
+                    Say "               Downloading via curl..." DarkGray
+                    & curl.exe -L --http2 --compressed --fail -o $msi $msiUrl 2>&1 | Out-Null
                     if ((Test-Path $msi) -and (Get-Item $msi).Length -gt 50MB) { $dlOk = $true }
                 }
-
-                # Method 3: last-resort Invoke-WebRequest
+                # Method 3: IWR
                 if (-not $dlOk) {
-                    Say "               Falling back to Invoke-WebRequest..." DarkGray
-                    try {
-                        Invoke-WebRequest -Uri $msiUrl -OutFile $msi -UseBasicParsing
-                        $dlOk = $true
-                    } catch {
-                        Say "               Download failed: $($_.Exception.Message)" Red
-                    }
+                    Say "               Downloading via Invoke-WebRequest..." DarkGray
+                    try { Invoke-WebRequest -Uri $msiUrl -OutFile $msi -UseBasicParsing; $dlOk = $true } catch { }
                 }
 
                 if ($dlOk) {
@@ -243,11 +247,31 @@ for ($i = 0; $i -lt $Names.Count; $i++) {
                     $secs    = "{0:N1}" -f $elapsed.TotalSeconds
                     $bytes   = (Get-Item $msi).Length
                     $mb      = "{0:N1}" -f ($bytes / 1MB)
-                    $rate    = if ($elapsed.TotalSeconds -gt 0) { "{0:N1}" -f ($bytes / 1MB / $elapsed.TotalSeconds) } else { "?" }
-                    Say "               Downloaded $mb MB in ${secs}s ($rate MB/s)" Green
+                    Say "               Downloaded $mb MB in ${secs}s" Green
+
+                    # Close Chrome to avoid in-use file conflicts
                     Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-                    Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart REBOOT=ReallySuppress" -Wait -Verb RunAs
-                    Say "               Install triggered (UAC prompt required)." DarkGray
+                    Start-Sleep -Seconds 2
+
+                    Say "               Installing MSI (UAC prompt - click YES)..." Yellow
+                    $msiLog = Join-Path $logDir "chrome-$channel-msi.log"
+                    try {
+                        $p = Start-Process msiexec.exe `
+                             -ArgumentList "/i `"$msi`" /qn /norestart REBOOT=ReallySuppress /L*v `"$msiLog`"" `
+                             -Verb RunAs -Wait -PassThru -ErrorAction Stop
+                        Say "               msiexec exit code: $($p.ExitCode)" DarkGray
+                        if ($p.ExitCode -eq 0) {
+                            Say "               Install OK. Chrome $channel is now at $env:ProgramFiles\Google\Chrome $channel\" Green
+                        } else {
+                            Say "               Install returned non-zero. See $msiLog" Red
+                        }
+                    } catch {
+                        Say "               UAC denied or msiexec failed: $($_.Exception.Message)" Red
+                        Say "               Hint: right-click PowerShell -> Run as Administrator, then re-run." Yellow
+                    }
+                    Remove-Item $msi -Force -ErrorAction SilentlyContinue
+                } else {
+                    Say "               Could not download Chrome $channel MSI. Check network/proxy." Red
                 }
             } else {
                 $gu = "${env:ProgramFiles(x86)}\Google\Update\GoogleUpdate.exe"
