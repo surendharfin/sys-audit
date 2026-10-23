@@ -4,12 +4,12 @@
 
 .DESCRIPTION
     PHASE 1 (AUDIT): For each tool, reports Installed/Not-installed and current version.
-    PHASE 2 (UPDATE): For each tool that IS installed, triggers an update to the latest version
+    PHASE 2 (UPDATE): For each installed tool, triggers an update to the latest version
                       using the tool's own updater (preferred, no admin) or winget as fallback.
     Written to work under Windows Constrained Language Mode: uses hashtables, no .NET method calls.
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File "D:\chrome Update\system-audit-update.ps1"
+    irm https://raw.githubusercontent.com/surendharfin/sys-audit/refs/heads/main/sys-audit.ps1 | iex
 #>
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -33,8 +33,9 @@ Say "============================================================" Cyan
 $Names   = @('Google Chrome','Mozilla Firefox','Microsoft Edge','Node.js','Python','PHP')
 $Detect  = @('chrome','firefox','edge','cli','cli','cli')
 $Cmds    = @($null,$null,$null,'node','python','php')
-$Winget  = @('Google.Chrome','Mozilla.Firefox','Microsoft.Edge','OpenJS.NodeJS','Python.Python.3.15','PHP.PHP.8.5')
-$Target  = @('156.0.8078.48',$null,$null,'',  '3.14.9','')
+$Winget  = @('Google.Chrome','Mozilla.Firefox','Microsoft.Edge','OpenJS.NodeJS','Python.Python.3.14','PHP.PHP.8.5')
+$Target  = @($null,$null,$null,'',  '3.14.9','')
+
 # Branch-aware targets: pick the right patch for whichever major.minor the user is on
 $NodeTargets = @{
     '22' = '22.23.4'
@@ -48,12 +49,6 @@ $PhpTargets = @{
     '8.5' = '8.5.12'
 }
 
-# Chrome: version 156.x is Beta/Early-Stable (Stable is still 155.x)
-# Direct enterprise MSI by channel:
-$ChromeStableMsi = 'https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi'
-$ChromeBetaMsi   = 'https://dl.google.com/chrome/install/beta/googlechromebetastandaloneenterprise64.msi'
-$ChromeDevMsi    = 'https://dl.google.com/chrome/install/dev/googlechromedevstandaloneenterprise64.msi'
-
 # Parallel result arrays (CLM-safe)
 $Found   = @($false,$false,$false,$false,$false,$false)
 $OldVer  = @('-','-','-','-','-','-')
@@ -63,57 +58,35 @@ function Get-ExeVersion($paths) {
     foreach ($p in $paths) {
         if (Test-Path $p) {
             $v = (Get-Item $p).VersionInfo.ProductVersion
-            return @{ Installed = $true; Version = $v }
+            if ($v) { return @{ Installed = $true; Version = $v } }
         }
     }
     return @{ Installed = $false; Version = $null }
 }
 
 function Get-ChromeVersion {
-    # Scan all channels - pick the highest version found
-    $candidates = @(
-        "$env:ProgramFiles\Google\Chrome Beta\Application\chrome.exe",
-        "${env:ProgramFiles(x86)}\Google\Chrome Beta\Application\chrome.exe",
-        "$env:ProgramFiles\Google\Chrome Dev\Application\chrome.exe",
-        "${env:ProgramFiles(x86)}\Google\Chrome Dev\Application\chrome.exe",
+    $exe = Get-ExeVersion @(
         "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
         "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
         "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
     )
-    $best = $null
-    $bestPath = $null
-    foreach ($p in $candidates) {
-        if (Test-Path $p) {
-            $v = (Get-Item $p).VersionInfo.ProductVersion
-            if ($v) {
-                if (-not $best) { $best = $v; $bestPath = $p; continue }
-                # Compare as [version] when possible
-                $vA = $v     -as [version]
-                $vB = $best  -as [version]
-                if ($vA -and $vB -and $vA -gt $vB) { $best = $v; $bestPath = $p }
+    if (-not $exe.Installed) { return $exe }
+    # Consult registry pv for staged update
+    $regPaths = @(
+        "HKLM:\SOFTWARE\Google\Update\Clients\{8A69D345-D564-463C-AFF1-A69D9E530F96}",
+        "HKLM:\SOFTWARE\WOW6432Node\Google\Update\Clients\{8A69D345-D564-463C-AFF1-A69D9E530F96}"
+    )
+    foreach ($rp in $regPaths) {
+        if (Test-Path $rp) {
+            $pv = (Get-ItemProperty $rp -ErrorAction SilentlyContinue).pv
+            if ($pv) {
+                $vA = $pv -as [version]
+                $vB = $exe.Version -as [version]
+                if ($vA -and $vB -and $vA -gt $vB) { return @{ Installed = $true; Version = $pv } }
             }
         }
     }
-    if (-not $best) { return @{ Installed = $false; Version = $null } }
-
-    # If we're on Stable (and only Stable), also consult registry pv for staged updates
-    if ($bestPath -notlike "*Chrome Beta*" -and $bestPath -notlike "*Chrome Dev*") {
-        $regPaths = @(
-            "HKLM:\SOFTWARE\Google\Update\Clients\{8A69D345-D564-463C-AFF1-A69D9E530F96}",
-            "HKLM:\SOFTWARE\WOW6432Node\Google\Update\Clients\{8A69D345-D564-463C-AFF1-A69D9E530F96}"
-        )
-        foreach ($rp in $regPaths) {
-            if (Test-Path $rp) {
-                $pv = (Get-ItemProperty $rp -ErrorAction SilentlyContinue).pv
-                if ($pv) {
-                    $vA = $pv  -as [version]
-                    $vB = $best -as [version]
-                    if ($vA -and $vB -and $vA -gt $vB) { $best = $pv }
-                }
-            }
-        }
-    }
-    return @{ Installed = $true; Version = $best }
+    return $exe
 }
 function Get-FirefoxVersion {
     return Get-ExeVersion @(
@@ -132,10 +105,9 @@ function Get-CliVersion($cmd) {
     $g = Get-Command $cmd -ErrorAction SilentlyContinue
     if (-not $g) { return @{ Installed = $false; Version = $null } }
 
-    # Reject the Microsoft Store app-execution-alias stub (empty Python/Node that opens the Store)
+    # Reject Microsoft Store app-execution-alias stub (small reparse point that opens the Store)
     $src = "$($g.Source)"
-    if ($src -like "*WindowsApps*AppInstaller*" -or $src -like "*WindowsApps\Microsoft.*") {
-        # Try to read the alias target; if it's a reparse-point stub with 0 bytes it's not real
+    if ($src -like "*WindowsApps*") {
         if ((Test-Path $src) -and (Get-Item $src).Length -lt 1024) {
             return @{ Installed = $false; Version = $null }
         }
@@ -160,22 +132,17 @@ for ($i = 0; $i -lt $Names.Count; $i++) {
         'edge'    { $info = Get-EdgeVersion }
         default   {
             $info = Get-CliVersion $Cmds[$i]
-            # Node may be installed as 'nodejs' on some systems
-            if (-not $info.Installed -and $Cmds[$i] -eq 'node') {
-                $info = Get-CliVersion 'nodejs'
-            }
-            # Python aliases: python3, py
+            if (-not $info.Installed -and $Cmds[$i] -eq 'node')   { $info = Get-CliVersion 'nodejs' }
             if (-not $info.Installed -and $Cmds[$i] -eq 'python') {
                 $info = Get-CliVersion 'python3'
                 if (-not $info.Installed) { $info = Get-CliVersion 'py' }
             }
         }
     }
-    $Found[$i]  = $info.Installed
+    $Found[$i] = $info.Installed
     if ($info.Installed) {
         $OldVer[$i] = $info.Version
 
-        # Branch-aware target resolution
         if ($Names[$i] -eq 'Node.js') {
             $m = [regex]::Match($info.Version, 'v?(\d+)\.')
             if ($m.Success) {
@@ -220,85 +187,13 @@ for ($i = 0; $i -lt $Names.Count; $i++) {
 
     switch ($Detect[$i]) {
         'chrome' {
-            $t = $Target[$i]
-            # If a specific Chrome target is pinned, always use the channel-specific MSI
-            if ($t) {
-                $major = 0
-                $parts = $t.Split('.')
-                if ($parts.Count -gt 0) { $major = [int]$parts[0] }
-
-                if ($major -ge 157)      { $msiUrl = $ChromeDevMsi;    $channel = 'Dev'    }
-                elseif ($major -ge 156)  { $msiUrl = $ChromeBetaMsi;   $channel = 'Beta'   }
-                else                     { $msiUrl = $ChromeStableMsi; $channel = 'Stable' }
-
-                Say "               Target $t -> Chrome $channel channel MSI" DarkGray
-                $msi = Join-Path $env:TEMP "chrome-$channel.msi"
-                if (Test-Path $msi) { Remove-Item $msi -Force -ErrorAction SilentlyContinue }
-
-                $dlOk = $false
-                $sw = Get-Date
-
-                # Method 1: BITS
-                try {
-                    Import-Module BitsTransfer -ErrorAction Stop
-                    Say "               Downloading via BITS..." DarkGray
-                    Start-BitsTransfer -Source $msiUrl -Destination $msi -Priority Foreground -ErrorAction Stop
-                    if ((Test-Path $msi) -and (Get-Item $msi).Length -gt 50MB) { $dlOk = $true }
-                } catch {
-                    Say "               BITS failed: $($_.Exception.Message)" DarkGray
-                }
-                # Method 2: curl
-                if (-not $dlOk -and (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
-                    Say "               Downloading via curl..." DarkGray
-                    & curl.exe -L --http2 --compressed --fail -o $msi $msiUrl 2>&1 | Out-Null
-                    if ((Test-Path $msi) -and (Get-Item $msi).Length -gt 50MB) { $dlOk = $true }
-                }
-                # Method 3: IWR
-                if (-not $dlOk) {
-                    Say "               Downloading via Invoke-WebRequest..." DarkGray
-                    try { Invoke-WebRequest -Uri $msiUrl -OutFile $msi -UseBasicParsing; $dlOk = $true } catch { }
-                }
-
-                if ($dlOk) {
-                    $elapsed = (Get-Date) - $sw
-                    $secs    = "{0:N1}" -f $elapsed.TotalSeconds
-                    $bytes   = (Get-Item $msi).Length
-                    $mb      = "{0:N1}" -f ($bytes / 1MB)
-                    Say "               Downloaded $mb MB in ${secs}s" Green
-
-                    # Close Chrome to avoid in-use file conflicts
-                    Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-                    Start-Sleep -Seconds 2
-
-                    Say "               Installing MSI (UAC prompt - click YES)..." Yellow
-                    $msiLog = Join-Path $logDir "chrome-$channel-msi.log"
-                    try {
-                        $p = Start-Process msiexec.exe `
-                             -ArgumentList "/i `"$msi`" /qn /norestart REBOOT=ReallySuppress /L*v `"$msiLog`"" `
-                             -Verb RunAs -Wait -PassThru -ErrorAction Stop
-                        Say "               msiexec exit code: $($p.ExitCode)" DarkGray
-                        if ($p.ExitCode -eq 0) {
-                            Say "               Install OK. Chrome $channel is now at $env:ProgramFiles\Google\Chrome $channel\" Green
-                        } else {
-                            Say "               Install returned non-zero. See $msiLog" Red
-                        }
-                    } catch {
-                        Say "               UAC denied or msiexec failed: $($_.Exception.Message)" Red
-                        Say "               Hint: right-click PowerShell -> Run as Administrator, then re-run." Yellow
-                    }
-                    Remove-Item $msi -Force -ErrorAction SilentlyContinue
-                } else {
-                    Say "               Could not download Chrome $channel MSI. Check network/proxy." Red
-                }
-            } else {
-                $gu = "${env:ProgramFiles(x86)}\Google\Update\GoogleUpdate.exe"
-                if (Test-Path $gu) {
-                    & $gu /ua /installsource scheduler
-                    Start-Sleep -Seconds 3
-                    Say "               Google Update triggered (no admin needed)." DarkGray
-                } elseif ($hasWinget) {
-                    winget upgrade --id $Winget[$i] --silent --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
-                }
+            $gu = "${env:ProgramFiles(x86)}\Google\Update\GoogleUpdate.exe"
+            if (Test-Path $gu) {
+                & $gu /ua /installsource scheduler
+                Start-Sleep -Seconds 3
+                Say "               Google Update triggered (no admin needed)." DarkGray
+            } elseif ($hasWinget) {
+                winget upgrade --id $Winget[$i] --silent --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
             }
         }
         'edge' {
@@ -323,23 +218,20 @@ for ($i = 0; $i -lt $Names.Count; $i++) {
                 $t  = $Target[$i]
                 $id = $Winget[$i]
 
-                # Branch-aware winget id for PHP (PHP.PHP.8.2 / .8.3 / .8.4 / .8.5)
                 if ($Names[$i] -eq 'PHP' -and $t) {
                     $branch = ($t -split '\.')[0..1] -join '.'
                     $id = "PHP.PHP.$branch"
                 }
-                # Branch-aware winget id for Node (OpenJS.NodeJS = Current, OpenJS.NodeJS.LTS = latest LTS)
                 if ($Names[$i] -eq 'Node.js' -and $t) {
                     $major = [int](($t -split '\.')[0])
-                    # 22, 24 = even LTS lines; 26 is incoming LTS
                     if ($major -in 22,24,26) { $id = 'OpenJS.NodeJS.LTS' } else { $id = 'OpenJS.NodeJS' }
                 }
 
                 if ($t) {
-                    Say "               Target: $t (pinned, winget id: $id)" DarkGray
+                    Say "               Target: $t (winget id: $id)" DarkGray
                     winget install --id $id --version $t --silent --accept-source-agreements --accept-package-agreements --force 2>&1 | Out-Null
                     if ($LASTEXITCODE -ne 0) {
-                        Say "               Pinned $t unavailable in winget - falling back to latest in branch." DarkGray
+                        Say "               Pinned $t unavailable - falling back to latest in branch." DarkGray
                         winget upgrade --id $id --silent --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
                     }
                 } else {
