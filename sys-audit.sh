@@ -64,7 +64,7 @@ say "Package manager: ${C}${PM}${N}"
 # target-version is resolved per installed branch below for Node/PHP.
 TOOLS=(
     "Google Chrome|google-chrome|--version|google-chrome-stable|"
-    "Mozilla Firefox|firefox|--version|firefox|"
+    "Mozilla Firefox|firefox|--version|firefox|158.0.1"
     "Microsoft Edge|microsoft-edge|--version|microsoft-edge-stable|156.0.4314.42"
     "Node.js|node|--version|nodejs|"
     "Python|python3|--version|python3|"
@@ -151,6 +151,32 @@ install_chrome_direct() {
         rm -f "$pkg"
     fi
 }
+# Pin Firefox to exact version via Mozilla's official tarball
+install_firefox_exact() {
+    local ver="$1"
+    [[ -z "$ver" ]] && return 1
+    local arch; arch=$(uname -m)
+    case "$arch" in
+        x86_64)  arch=linux-x86_64 ;;
+        aarch64) arch=linux-aarch64 ;;
+        *) say "               Unsupported arch for Firefox: $arch" ; return 1 ;;
+    esac
+    local url="https://ftp.mozilla.org/pub/firefox/releases/${ver}/${arch}/en-US/firefox-${ver}.tar.xz"
+    local tmp="/tmp/firefox-${ver}.tar.xz"
+    say "               Fetching exact Firefox ${ver} from mozilla.org..."
+    curl -fsSL -o "$tmp" "$url" >>"$LOG" 2>&1
+    if [[ ! -s "$tmp" ]]; then
+        say "               Download failed - Firefox ${ver} may not exist yet."
+        return 1
+    fi
+    rm -rf /opt/firefox
+    tar -xJf "$tmp" -C /opt/ >>"$LOG" 2>&1
+    rm -f "$tmp"
+    ln -sf /opt/firefox/firefox /usr/local/bin/firefox
+    hash -r
+    say "               Installed firefox ${ver} to /opt/firefox"
+}
+
 install_edge_direct() {
     local url pkg
     if [[ "$PM" == "apt" ]]; then
@@ -329,6 +355,11 @@ else
                 "Node.js")
                     say "               Package manager gave $clean_new, need $target - fetching exact Node from nodejs.org..."
                     install_node_exact "$target"
+                    NEW_VER[$name]=$("$cmd" "$flag" 2>/dev/null | head -n1)
+                    ;;
+                "Mozilla Firefox")
+                    say "               Package manager gave $clean_new, need $target - fetching exact Firefox from mozilla.org..."
+                    install_firefox_exact "$target"
                     NEW_VER[$name]=$("$cmd" "$flag" 2>/dev/null | head -n1)
                     ;;
             esac

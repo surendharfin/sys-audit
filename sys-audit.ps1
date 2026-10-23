@@ -66,7 +66,7 @@ $Names   = @('Google Chrome','Mozilla Firefox','Microsoft Edge','Node.js','Pytho
 $Detect  = @('chrome','firefox','edge','cli','cli','cli')
 $Cmds    = @($null,$null,$null,'node','python','php')
 $Winget  = @('Google.Chrome','Mozilla.Firefox','Microsoft.Edge','OpenJS.NodeJS','Python.Python.3.14','PHP.PHP.8.5')
-$Target  = @($null,$null,$null,'',  '3.14.9','')
+$Target  = @($null,'158.0.1',$null,'',  '3.14.9','')
 
 # Branch-aware targets: pick the right patch for whichever major.minor the user is on
 $NodeTargets = @{
@@ -183,6 +183,30 @@ function Install-ChromeStableLatest {
         Say "               UAC denied or run as Administrator to install." Red
     }
     Remove-Item $msi -Force -ErrorAction SilentlyContinue
+}
+
+function Install-FirefoxExact($ver) {
+    if (-not $ver) { return }
+    Say "               Downloading Firefox $ver installer from Mozilla..." Yellow
+    $url = "https://download.mozilla.org/?product=firefox-$ver&os=win64&lang=en-US"
+    $exe = "$env:TEMP\firefox-$ver-setup.exe"
+    $sw  = Get-Date
+    if (-not (Download-Fast $url $exe)) {
+        Say "               Download failed. Firefox $ver may not exist yet." Red
+        return
+    }
+    $mb   = "{0:N1}" -f ((Get-Item $exe).Length / 1MB)
+    $secs = "{0:N1}" -f ((Get-Date) - $sw).TotalSeconds
+    Say "               Downloaded $mb MB in ${secs}s" Green
+    Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    try {
+        $p = Start-Process $exe -ArgumentList "/S" -Verb RunAs -Wait -PassThru -ErrorAction Stop
+        Say "               Firefox installer exit code: $($p.ExitCode)" DarkGray
+    } catch {
+        Say "               UAC denied or installer failed." Red
+    }
+    Remove-Item $exe -Force -ErrorAction SilentlyContinue
 }
 
 function Install-EdgeStableLatest {
@@ -337,7 +361,9 @@ for ($i = 0; $i -lt $Names.Count; $i++) {
             }
         }
         'firefox' {
-            if ($hasWinget) {
+            if ($Target[$i]) {
+                Install-FirefoxExact $Target[$i]
+            } elseif ($hasWinget) {
                 winget upgrade --id $Winget[$i] --silent --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
             } else {
                 Say "               winget missing - Firefox self-updates on next launch." DarkGray
