@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    vulnpatch-windows.ps1 - DETECT and PATCH in one file: the Windows counterpart of vulnpatch-linux.sh
+    vulnpatch-windows.ps1 - DETECT and PATCH in one file: the Windows counterpart of vulnpatch-linux.sh.
 
 .DESCRIPTION
     DETECT: finds EVERY copy of PHP, Node.js, Python, Chrome, Chromium, Edge, Firefox and Brave on this
@@ -46,6 +46,9 @@
     powershell -ExecutionPolicy Bypass -File .\vulnpatch-windows.ps1 -Apply
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\vulnpatch-windows.ps1 -Apply -Pick 1,3,5-7 -Yes
+.EXAMPLE
+    From memory, nothing saved (works in Constrained Language Mode, the window stays open):
+    iex "& { $(irm https://raw.githubusercontent.com/surendharfin/sys-audit/main/Patch_Win.ps1) } -Apply"
 #>
 [CmdletBinding()]
 param(
@@ -739,7 +742,8 @@ function Set-Kind($r) {   # picks the action for one finding
             if ($needRt) { $kind = 'installer'; $desc = "Python $($r.Fixed) installer (python.org)" }
             else { $kind = 'certifi'; $desc = 'refresh certifi' }
         } elseif ($needRt -and $m -eq 'pymanager' -and $r.Owner -eq $Me) { $kind = 'pymanager'; $desc = "py install --update $(Get-Branch $r.Version 2)" }
-        elseif ($needRt) { $kind = 'runtime'; $desc = "$($appStep)python.org $($r.Fixed) runtime files swapped in (site-packages kept)" }
+        elseif ($needRt -and (Get-PyLayout $r)) { $kind = 'runtime'; $desc = "$($appStep)python.org $($r.Fixed) runtime files swapped in (site-packages kept)" }
+        elseif ($needRt) { $kind = 'certifi'; $desc = "$($appStep)refresh certifi (MinGW/custom build: only its vendor can ship Python $($r.Fixed))" }
         else { $kind = 'certifi'; $desc = "$($appStep)refresh certifi in place" }
     }
     elseif ($p -eq 'Node.js') {
@@ -1255,64 +1259,71 @@ function Show-RestartNeeded {
 }
 
 # =============================================================================
-# MAIN
+# MAIN - a function that returns the exit code, so the script also runs from memory
+# (irm ... | iex) without 'exit' closing the PowerShell window
 # =============================================================================
-$start = Get-Date
-$os = (Get-CimInstance Win32_OperatingSystem).Caption
-$modeTxt = switch ($Mode) { 'scan' { 'DETECTION ONLY' } 'plan' { 'DETECTION + PLAN (nothing will be changed)' } default { 'DETECT + PATCH + VERIFY' } }
-Write-Host "`n== vulnpatch: $env:COMPUTERNAME | $os | $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | $modeTxt ==" -ForegroundColor Cyan
-if (-not $FullLang) { Write-Host "  PowerShell language mode: $($ExecutionContext.SessionState.LanguageMode) (managed laptop) - using the compatible code paths" -ForegroundColor DarkGray }
-if ($Mode -eq 'apply' -and -not $IsAdmin) { Write-Host '  -Apply needs an elevated PowerShell (Run as administrator).' -ForegroundColor Red; exit 2 }
-$script:Roots = Get-SearchRoots
-Write-Host "  searching: $($script:Roots -join ' ')"
-if (-not $IsAdmin) { Write-Note 'not elevated: other users'' folders cannot be read - run as administrator for full coverage' }
+function Invoke-Main {
+    $start = Get-Date
+    $os = (Get-CimInstance Win32_OperatingSystem).Caption
+    $modeTxt = switch ($Mode) { 'scan' { 'DETECTION ONLY' } 'plan' { 'DETECTION + PLAN (nothing will be changed)' } default { 'DETECT + PATCH + VERIFY' } }
+    Write-Host "`n== vulnpatch: $env:COMPUTERNAME | $os | $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | $modeTxt ==" -ForegroundColor Cyan
+    if (-not $FullLang) { Write-Host "  PowerShell language mode: $($ExecutionContext.SessionState.LanguageMode) (managed laptop) - using the compatible code paths" -ForegroundColor DarkGray }
+    if ($Mode -eq 'apply' -and -not $IsAdmin) { Write-Host '  -Apply needs an elevated PowerShell (Run as administrator).' -ForegroundColor Red; return 2 }
+    $script:Roots = Get-SearchRoots
+    Write-Host "  searching: $($script:Roots -join ' ')"
+    if (-not $IsAdmin) { Write-Note 'not elevated: other users'' folders cannot be read - run as administrator for full coverage' }
 
-Write-Step 'Detection: every copy on the machine'
-Invoke-Detection
-
-if ($Mode -eq 'scan') {
-    Show-Report
-    if (-not $Json) { $Json = Join-Path $env:TEMP "vulnscan-$env:COMPUTERNAME-$Stamp.json" }
-    Write-JsonReport $Json
-    Write-Host "  JSON report: $Json   ($([int]((Get-Date) - $start).TotalSeconds)s)"
-    if ($script:ResultBad) { exit 1 } else { exit 0 }
-}
-
-Show-Brief
-Build-Plan
-if (($script:PickOrder.Count + $script:External.Count) -eq 0) { Write-Step 'Nothing to patch - every copy found is already patched'; exit 0 }
-Write-Step 'Patch plan'
-Show-Plan
-
-if ($Mode -eq 'plan') {
-    Write-Host "`n  Nothing was changed. To patch: run this script with -Apply in an elevated PowerShell."
-    Write-Host '  It will ask which numbers to patch (e.g. all | 1,3,5-7 | php,node), or pass -Pick to choose up front.'
-    exit 1
-}
-if (-not $script:PickOrder.Count) { exit 1 }
-if (-not (Select-Items)) { exit 1 }
-
-New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-Start-Transcript -Path (Join-Path $LogDir "vulnpatch-$Stamp.log") | Out-Null
-try {
-    Write-JsonReport (Join-Path $LogDir "before-$Stamp.json")
-    Write-Step 'Patching'
-    Invoke-Patch
-    Write-Step 'Verification: scanning the whole machine again'
+    Write-Step 'Detection: every copy on the machine'
     Invoke-Detection
-    Write-JsonReport (Join-Path $LogDir "after-$Stamp.json")
-    $script:StillBad = 0
-    Show-Verify
-    Show-RestartNeeded
-    Write-Host "`n  Logs: $LogDir\vulnpatch-$Stamp.log   scans: before-$Stamp.json / after-$Stamp.json   ($([int]((Get-Date) - $start).TotalMinutes) min)"
-} catch {
-    # unexpected stop: say exactly where, so it can be reported and fixed
-    Write-Host "`n  STOPPED: $($_.Exception.GetType().FullName): $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "  at script line $($_.InvocationInfo.ScriptLineNumber): $("$($_.InvocationInfo.Line)".Trim())" -ForegroundColor Red
-    Write-Host "  $($_.ScriptStackTrace -replace "`n", "`n  ")" -ForegroundColor DarkGray
-    Write-Host "  PowerShell $($PSVersionTable.PSVersion) | language mode $($ExecutionContext.SessionState.LanguageMode) | log: $LogDir\vulnpatch-$Stamp.log"
-    $script:StillBad = 1
-} finally {
-    Stop-Transcript | Out-Null
+
+    if ($Mode -eq 'scan') {
+        Show-Report
+        $out = $Json; if (-not $out) { $out = Join-Path $env:TEMP "vulnscan-$env:COMPUTERNAME-$Stamp.json" }
+        Write-JsonReport $out
+        Write-Host "  JSON report: $out   ($([int]((Get-Date) - $start).TotalSeconds)s)"
+        if ($script:ResultBad) { return 1 } else { return 0 }
+    }
+
+    Show-Brief
+    Build-Plan
+    if (($script:PickOrder.Count + $script:External.Count) -eq 0) { Write-Step 'Nothing to patch - every copy found is already patched'; return 0 }
+    Write-Step 'Patch plan'
+    Show-Plan
+
+    if ($Mode -eq 'plan') {
+        Write-Host "`n  Nothing was changed. To patch: run it again with -Apply in an elevated PowerShell."
+        Write-Host '  It will ask which numbers to patch (e.g. all | 1,3,5-7 | php,node), or pass -Pick to choose up front.'
+        return 1
+    }
+    if (-not $script:PickOrder.Count) { return 1 }
+    if (-not (Select-Items)) { return 1 }
+
+    New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+    Start-Transcript -Path (Join-Path $LogDir "vulnpatch-$Stamp.log") | Out-Null
+    try {
+        Write-JsonReport (Join-Path $LogDir "before-$Stamp.json")
+        Write-Step 'Patching'
+        Invoke-Patch
+        Write-Step 'Verification: scanning the whole machine again'
+        Invoke-Detection
+        Write-JsonReport (Join-Path $LogDir "after-$Stamp.json")
+        $script:StillBad = 0
+        Show-Verify
+        Show-RestartNeeded
+        Write-Host "`n  Logs: $LogDir\vulnpatch-$Stamp.log   scans: before-$Stamp.json / after-$Stamp.json   ($([int]((Get-Date) - $start).TotalMinutes) min)"
+    } catch {
+        # unexpected stop: say exactly where, so it can be reported and fixed
+        Write-Host "`n  STOPPED: $($_.Exception.GetType().FullName): $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "  at script line $($_.InvocationInfo.ScriptLineNumber): $("$($_.InvocationInfo.Line)".Trim())" -ForegroundColor Red
+        Write-Host "  $($_.ScriptStackTrace -replace "`n", "`n  ")" -ForegroundColor DarkGray
+        Write-Host "  PowerShell $($PSVersionTable.PSVersion) | language mode $($ExecutionContext.SessionState.LanguageMode) | log: $LogDir\vulnpatch-$Stamp.log"
+        $script:StillBad = 1
+    } finally {
+        Stop-Transcript | Out-Null
+    }
+    if ($script:StillBad) { return 1 } else { return 0 }
 }
-if ($script:StillBad) { exit 1 } else { exit 0 }
+
+$rc = @(Invoke-Main)[-1]
+if ($PSCommandPath) { exit $rc }      # run from a file: exit code for fleet tools (Intune, SCCM, scripts)
+$global:LASTEXITCODE = $rc            # run from memory: the window stays open with the results on screen
