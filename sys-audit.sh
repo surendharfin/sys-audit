@@ -65,7 +65,7 @@ say "Package manager: ${C}${PM}${N}"
 TOOLS=(
     "Google Chrome|google-chrome|--version|google-chrome-stable|"
     "Mozilla Firefox|firefox|--version|firefox|"
-    "Microsoft Edge|microsoft-edge|--version|microsoft-edge-stable|"
+    "Microsoft Edge|microsoft-edge|--version|microsoft-edge-stable|156.0.4314.42"
     "Node.js|node|--version|nodejs|"
     "Python|python3|--version|python3|"
     "PHP|php|--version|php|"
@@ -86,6 +86,51 @@ declare -A PHP_TARGETS=(
 
 node_major() { echo "$1" | sed -E 's/^v?([0-9]+)\..*/\1/'; }
 php_branch() { echo "$1" | sed -E 's/^PHP ([0-9]+\.[0-9]+)\..*/\1/'; }
+
+# Pin Node.js to exact micro version using official nodejs.org binary tarball
+# (NodeSource repo only keeps "latest in major" so apt can't pin 24.22.1 vs 24.22.0)
+install_node_exact() {
+    local ver="$1"
+    [[ -z "$ver" ]] && return 1
+    local arch; arch=$(uname -m)
+    case "$arch" in
+        x86_64)  arch=linux-x64 ;;
+        aarch64) arch=linux-arm64 ;;
+        armv7l)  arch=linux-armv7l ;;
+        *) say "               Unsupported arch for Node binary tarball: $arch" ; return 1 ;;
+    esac
+    local url="https://nodejs.org/dist/v${ver}/node-v${ver}-${arch}.tar.xz"
+    local tmp="/tmp/node-v${ver}.tar.xz"
+    say "               Fetching exact Node.js v${ver} from nodejs.org..."
+    curl -fsSL -o "$tmp" "$url" >>"$LOG" 2>&1
+    if [[ ! -s "$tmp" ]]; then
+        say "               Download failed: $url"
+        return 1
+    fi
+    tar -xJf "$tmp" -C /tmp/ >>"$LOG" 2>&1
+    local src="/tmp/node-v${ver}-${arch}"
+    # Install under /usr/local (overrides NodeSource)
+    cp -rT "$src"/bin     /usr/local/bin
+    cp -rT "$src"/lib     /usr/local/lib
+    cp -rT "$src"/include /usr/local/include
+    cp -rT "$src"/share   /usr/local/share
+    rm -rf "$src" "$tmp"
+    hash -r
+    say "               Installed node v${ver} to /usr/local"
+}
+
+# Pin Edge to exact version via Microsoft repo
+install_edge_exact() {
+    local ver="$1"
+    [[ -z "$ver" ]] && { install_edge_direct; return; }
+    if [[ "$PM" == "apt" ]]; then
+        apt-get install -y --allow-downgrades "microsoft-edge-stable=${ver}-1" >>"$LOG" 2>&1 \
+          || apt-get install -y --allow-downgrades "microsoft-edge-stable=${ver}*" >>"$LOG" 2>&1 \
+          || install_edge_direct
+    elif [[ "$PM" == "dnf" || "$PM" == "yum" ]]; then
+        $PM install -y "microsoft-edge-stable-${ver}" >>"$LOG" 2>&1 || install_edge_direct
+    fi
+}
 
 # Direct Chrome/Edge installers (fallback when package manager won't update)
 install_chrome_direct() {
@@ -267,8 +312,27 @@ else
         fi
         NEW_VER[$name]=$("$cmd" "$flag" 2>/dev/null | head -n1)
 
-        # If package manager didn't bump the version, try direct install for browsers
-        if [[ "${NEW_VER[$name]}" == "${OLD_VER[$name]}" ]]; then
+        # Check if target version was actually hit (strip 'v', 'Google Chrome', 'PHP' prefix)
+        clean_new=$(echo "${NEW_VER[$name]}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1)
+        if [[ -n "$target" && "$clean_new" != "$target" ]]; then
+            case "$name" in
+                "Google Chrome")
+                    say "               Package manager gave $clean_new, need $target - trying direct Chrome install..."
+                    install_chrome_direct
+                    NEW_VER[$name]=$("$cmd" "$flag" 2>/dev/null | head -n1)
+                    ;;
+                "Microsoft Edge")
+                    say "               Package manager gave $clean_new, need $target - trying exact Edge version..."
+                    install_edge_exact "$target"
+                    NEW_VER[$name]=$("$cmd" "$flag" 2>/dev/null | head -n1)
+                    ;;
+                "Node.js")
+                    say "               Package manager gave $clean_new, need $target - fetching exact Node from nodejs.org..."
+                    install_node_exact "$target"
+                    NEW_VER[$name]=$("$cmd" "$flag" 2>/dev/null | head -n1)
+                    ;;
+            esac
+        elif [[ "${NEW_VER[$name]}" == "${OLD_VER[$name]}" ]]; then
             case "$name" in
                 "Google Chrome")
                     say "               Package manager unchanged - trying direct Chrome install..."
