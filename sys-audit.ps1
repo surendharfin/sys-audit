@@ -435,6 +435,16 @@ for ($i = 0; $i -lt $Names.Count; $i++) {
         continue
     }
 
+    # Skip if already at target version
+    if ($Target[$i]) {
+        $cleanOld = ("$($OldVer[$i])" -replace '[^\d.]','')
+        if ($cleanOld -like "*$($Target[$i])*") {
+            Say ("  [OK]         {0,-18}  already at target {1} - skipping" -f $Names[$i], $Target[$i]) Green
+            $NewVer[$i] = $OldVer[$i]
+            continue
+        }
+    }
+
     Say ("  [UPDATING]   {0,-18}  current: {1}" -f $Names[$i], $OldVer[$i]) Cyan
 
     switch ($Detect[$i]) {

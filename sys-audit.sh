@@ -307,6 +307,15 @@ else
         fi
         pkg="${PKG[$name]}"
         target="${TARGET[$name]}"
+        # Skip if already at target version
+        if [[ -n "$target" ]]; then
+            clean_old=$(echo "${OLD_VER[$name]}" | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)
+            if [[ "$clean_old" == *"$target"* ]]; then
+                printf "  ${G}[OK]${N}         %-18s  already at target %s - skipping\n" "$name" "$target" | tee -a "$LOG"
+                NEW_VER[$name]="${OLD_VER[$name]}"
+                continue
+            fi
+        fi
         printf "  ${C}[UPDATING]${N}   %-18s  current: %s   ${D}(target: %s)${N}\n" "$name" "${OLD_VER[$name]}" "${target:-latest}" | tee -a "$LOG"
         case "$PM" in
             apt)
