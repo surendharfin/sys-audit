@@ -8,6 +8,28 @@
 
 set -u
 
+# ----- Auto-elevate: re-exec with sudo if not root -----
+if [[ $EUID -ne 0 ]]; then
+    echo ""
+    echo "========================================================"
+    echo "  Not running as root."
+    echo "  Chrome/Edge/Node/Python/PHP updates require root."
+    echo "  Relaunching under sudo (may prompt for password)..."
+    echo "========================================================"
+    echo ""
+    if command -v sudo >/dev/null 2>&1; then
+        # If invoked via curl|bash, there's no $0 file - fetch and re-exec
+        if [[ -r "${BASH_SOURCE[0]:-}" ]]; then
+            exec sudo bash "${BASH_SOURCE[0]}" "$@"
+        else
+            exec sudo bash -c "curl -fsSL https://raw.githubusercontent.com/surendharfin/sys-audit/refs/heads/main/sys-audit.sh | bash"
+        fi
+    else
+        echo "ERROR: sudo not available. Re-run this script as root manually." >&2
+        exit 1
+    fi
+fi
+
 LOGDIR="/var/log/system-audit"
 mkdir -p "$LOGDIR" 2>/dev/null || LOGDIR="/tmp"
 LOG="$LOGDIR/audit-$(date +%Y%m%d-%H%M%S).log"
@@ -26,13 +48,8 @@ say "${C}============================================================${N}"
 say "${C}    SYSTEM AUDIT  -  $(hostname)  -  $(date)${N}"
 say "${C}============================================================${N}"
 
-# --- Must be root for updates ---
-if [[ $EUID -ne 0 ]]; then
-    say "${Y}WARNING: not running as root. Audit will run, updates will be skipped.${N}"
-    IS_ROOT=0
-else
-    IS_ROOT=1
-fi
+IS_ROOT=1  # guaranteed by auto-elevate block above
+say "${G}Running as root - proceeding with full install flow.${N}"
 
 # --- Detect package manager ---
 if   command -v apt-get >/dev/null 2>&1; then PM=apt
@@ -69,6 +86,38 @@ declare -A PHP_TARGETS=(
 
 node_major() { echo "$1" | sed -E 's/^v?([0-9]+)\..*/\1/'; }
 php_branch() { echo "$1" | sed -E 's/^PHP ([0-9]+\.[0-9]+)\..*/\1/'; }
+
+# Direct Chrome/Edge installers (fallback when package manager won't update)
+install_chrome_direct() {
+    local url pkg
+    if [[ "$PM" == "apt" ]]; then
+        url="https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+        pkg="/tmp/chrome.deb"
+        say "               Downloading Chrome .deb directly..."
+        curl -fsSL -o "$pkg" "$url" >>"$LOG" 2>&1
+        apt-get install -y "$pkg" >>"$LOG" 2>&1 || dpkg -i "$pkg" >>"$LOG" 2>&1
+        rm -f "$pkg"
+    elif [[ "$PM" == "dnf" || "$PM" == "yum" ]]; then
+        url="https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm"
+        pkg="/tmp/chrome.rpm"
+        say "               Downloading Chrome .rpm directly..."
+        curl -fsSL -o "$pkg" "$url" >>"$LOG" 2>&1
+        $PM install -y "$pkg" >>"$LOG" 2>&1
+        rm -f "$pkg"
+    fi
+}
+install_edge_direct() {
+    local url pkg
+    if [[ "$PM" == "apt" ]]; then
+        url="https://packages.microsoft.com/repos/edge/pool/main/m/microsoft-edge-stable/microsoft-edge-stable_latest_amd64.deb"
+        pkg="/tmp/edge.deb"
+        # Microsoft doesn't publish a 'latest' deb URL; use the repo instead
+        apt-get install -y --only-upgrade microsoft-edge-stable >>"$LOG" 2>&1 \
+          || apt-get install -y microsoft-edge-stable >>"$LOG" 2>&1
+    elif [[ "$PM" == "dnf" || "$PM" == "yum" ]]; then
+        $PM install -y microsoft-edge-stable >>"$LOG" 2>&1
+    fi
+}
 
 declare -A OLD_VER NEW_VER FOUND PKG TARGET
 
@@ -217,6 +266,23 @@ else
             esac
         fi
         NEW_VER[$name]=$("$cmd" "$flag" 2>/dev/null | head -n1)
+
+        # If package manager didn't bump the version, try direct install for browsers
+        if [[ "${NEW_VER[$name]}" == "${OLD_VER[$name]}" ]]; then
+            case "$name" in
+                "Google Chrome")
+                    say "               Package manager unchanged - trying direct Chrome install..."
+                    install_chrome_direct
+                    NEW_VER[$name]=$("$cmd" "$flag" 2>/dev/null | head -n1)
+                    ;;
+                "Microsoft Edge")
+                    say "               Package manager unchanged - trying direct Edge install..."
+                    install_edge_direct
+                    NEW_VER[$name]=$("$cmd" "$flag" 2>/dev/null | head -n1)
+                    ;;
+            esac
+        fi
+
         if [[ "${NEW_VER[$name]}" == "${OLD_VER[$name]}" ]]; then
             printf "               ${D}Already latest: %s${N}\n" "${NEW_VER[$name]}" | tee -a "$LOG"
         else
