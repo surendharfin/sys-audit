@@ -1,126 +1,232 @@
 #!/usr/bin/env bash
 # =====================================================================
-#  Chrome Enterprise Updater - Linux (Debian/Ubuntu + RHEL/Fedora)
-#  Target: latest Google Chrome Stable from Google's official repos
-#  Run as root (sudo) or push via Ansible / Satellite / SCCM-Linux
+#  System audit + updater for Chrome, Node.js, Python, PHP on Linux
+#  Phase 1: Audit (found / not found + version)
+#  Phase 2: Update installed tools to latest via system package manager
 # =====================================================================
 
-set -euo pipefail
+set -u
 
-LOGDIR="/var/log/chrome-update"
-mkdir -p "$LOGDIR"
-LOG="$LOGDIR/chrome-update.log"
+LOGDIR="/var/log/system-audit"
+mkdir -p "$LOGDIR" 2>/dev/null || LOGDIR="/tmp"
+LOG="$LOGDIR/audit-$(date +%Y%m%d-%H%M%S).log"
 
-log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
-
-log "===== Chrome update started on $(hostname) ====="
-
-if [[ $EUID -ne 0 ]]; then
-    log "ERROR: must run as root"
-    exit 1
-fi
-
-# --- Capture OLD version (before update) ---
-if command -v google-chrome >/dev/null 2>&1; then
-    OLD_VER="$(google-chrome --version 2>/dev/null | awk '{print $NF}')"
+# Colors
+if [ -t 1 ]; then
+    R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; C=$'\e[36m'; D=$'\e[2m'; N=$'\e[0m'
 else
-    OLD_VER="not installed"
+    R=''; G=''; Y=''; C=''; D=''; N=''
 fi
-log "[BEFORE] Current Chrome version: $OLD_VER"
 
-ARCH="$(uname -m)"
-if [[ "$ARCH" != "x86_64" ]]; then
-    log "ERROR: unsupported architecture $ARCH (Google Chrome ships amd64 only)"
-    exit 2
+say()  { echo -e "$*" | tee -a "$LOG"; }
+line() { say "------------------------------------------------------------"; }
+
+say ""
+say "${C}============================================================${N}"
+say "${C}    SYSTEM AUDIT  -  $(hostname)  -  $(date)${N}"
+say "${C}============================================================${N}"
+
+# --- Must be root for updates ---
+if [[ $EUID -ne 0 ]]; then
+    say "${Y}WARNING: not running as root. Audit will run, updates will be skipped.${N}"
+    IS_ROOT=0
+else
+    IS_ROOT=1
 fi
 
 # --- Detect package manager ---
-if   command -v apt-get >/dev/null 2>&1; then PM="apt"
-elif command -v dnf     >/dev/null 2>&1; then PM="dnf"
-elif command -v yum     >/dev/null 2>&1; then PM="yum"
-elif command -v zypper  >/dev/null 2>&1; then PM="zypper"
-else
-    log "ERROR: no supported package manager found"
-    exit 3
+if   command -v apt-get >/dev/null 2>&1; then PM=apt
+elif command -v dnf     >/dev/null 2>&1; then PM=dnf
+elif command -v yum     >/dev/null 2>&1; then PM=yum
+elif command -v zypper  >/dev/null 2>&1; then PM=zypper
+else PM=none
 fi
-log "Package manager: $PM"
+say "Package manager: ${C}${PM}${N}"
 
-install_repo_debian() {
-    local key="/usr/share/keyrings/google-chrome.gpg"
-    local list="/etc/apt/sources.list.d/google-chrome.list"
-    if [[ ! -f "$key" ]]; then
-        log "Adding Google signing key"
-        curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
-            | gpg --dearmor -o "$key"
+# --- Tools to audit: name|command|version-flag|package-name|target-version ---
+TOOLS=(
+    "Google Chrome|google-chrome|--version|google-chrome-stable|"
+    "Mozilla Firefox|firefox|--version|firefox|"
+    "Microsoft Edge|microsoft-edge|--version|microsoft-edge-stable|"
+    "Node.js|node|--version|nodejs|26.12.1"
+    "Python|python3.14|--version|python3.14|3.14.9"
+    "PHP|php|--version|php8.5|8.5.12"
+)
+# PHP fallback (8.4 branch) if 8.5.12 is unavailable
+PHP_FALLBACK_PKG="php8.4"
+PHP_FALLBACK_VER="8.4.27"
+
+declare -A OLD_VER NEW_VER FOUND PKG TARGET
+
+# ---------- PHASE 1: AUDIT ----------
+say ""
+say "${Y}>>> PHASE 1: AUDIT${N}"
+line
+
+for entry in "${TOOLS[@]}"; do
+    IFS='|' read -r name cmd flag pkg target <<< "$entry"
+    PKG[$name]=$pkg
+    TARGET[$name]=$target
+    # Also look up generic command for CLI tools (python3 / php) when pinned command isn't found
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        case "$name" in
+            Python) cmd=python3 ;;
+            PHP)    cmd=php     ;;
+        esac
     fi
-    if [[ ! -f "$list" ]]; then
-        log "Adding Chrome apt repo"
-        echo "deb [arch=amd64 signed-by=$key] https://dl.google.com/linux/chrome/deb/ stable main" \
-            > "$list"
+    if command -v "$cmd" >/dev/null 2>&1; then
+        ver=$("$cmd" "$flag" 2>/dev/null | head -n1)
+        FOUND[$name]=1
+        OLD_VER[$name]="$ver"
+        printf "  ${G}[FOUND]${N}      %-15s  version: %s   ${D}(target: %s)${N}\n" "$name" "$ver" "${target:-latest}" | tee -a "$LOG"
+    else
+        FOUND[$name]=0
+        OLD_VER[$name]="-"
+        printf "  ${R}[NOT FOUND]${N}  %-15s  (not installed)   ${D}(target: %s)${N}\n" "$name" "${target:-latest}" | tee -a "$LOG"
     fi
-}
+done
 
-install_repo_rpm() {
-    local repo="/etc/yum.repos.d/google-chrome.repo"
-    if [[ ! -f "$repo" ]]; then
-        log "Adding Chrome yum/dnf repo"
-        cat > "$repo" <<'EOF'
-[google-chrome]
-name=google-chrome
-baseurl=https://dl.google.com/linux/chrome/rpm/stable/x86_64
-enabled=1
-gpgcheck=1
-gpgkey=https://dl.google.com/linux/linux_signing_key.pub
-EOF
-    fi
-}
+# ---------- PHASE 2: UPDATE ----------
+say ""
+say "${Y}>>> PHASE 2: UPDATE${N}"
+line
 
-case "$PM" in
-    apt)
-        install_repo_debian
-        log "Running apt-get update"
-        apt-get update -y >>"$LOG" 2>&1
-        log "Installing/upgrading google-chrome-stable"
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade google-chrome-stable >>"$LOG" 2>&1 \
-            || DEBIAN_FRONTEND=noninteractive apt-get install -y google-chrome-stable >>"$LOG" 2>&1
-        ;;
-    dnf)
-        install_repo_rpm
-        log "Installing/upgrading google-chrome-stable via dnf"
-        dnf install -y google-chrome-stable >>"$LOG" 2>&1
-        ;;
-    yum)
-        install_repo_rpm
-        log "Installing/upgrading google-chrome-stable via yum"
-        yum install -y google-chrome-stable >>"$LOG" 2>&1
-        ;;
-    zypper)
-        rpm --import https://dl.google.com/linux/linux_signing_key.pub >>"$LOG" 2>&1 || true
-        zypper --non-interactive addrepo -f \
-            https://dl.google.com/linux/chrome/rpm/stable/x86_64 google-chrome 2>/dev/null || true
-        log "Installing/upgrading google-chrome-stable via zypper"
-        zypper --non-interactive install --no-confirm google-chrome-stable >>"$LOG" 2>&1
-        ;;
-esac
-
-# --- Report NEW installed version ---
-if command -v google-chrome >/dev/null 2>&1; then
-    NEW_VER="$(google-chrome --version 2>/dev/null | awk '{print $NF}')"
+if [[ $IS_ROOT -eq 0 ]]; then
+    say "${R}Skipping updates (not root). Re-run with sudo.${N}"
 else
-    log "ERROR: google-chrome binary not found after install"
-    exit 4
+    # ---- Add vendor repos needed for pinned versions ----
+    if [[ "$PM" == "apt" ]]; then
+        # Google Chrome
+        if [[ "${FOUND[Google Chrome]}" == "1" && ! -f /etc/apt/sources.list.d/google-chrome.list ]]; then
+            curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+                | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg 2>>"$LOG"
+            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
+                > /etc/apt/sources.list.d/google-chrome.list
+        fi
+
+        # Microsoft Edge
+        if [[ "${FOUND[Microsoft Edge]}" == "1" && ! -f /etc/apt/sources.list.d/microsoft-edge.list ]]; then
+            curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+                | gpg --dearmor -o /usr/share/keyrings/microsoft-edge.gpg 2>>"$LOG"
+            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-edge.gpg] https://packages.microsoft.com/repos/edge stable main" \
+                > /etc/apt/sources.list.d/microsoft-edge.list
+        fi
+
+        # NodeSource for Node.js 26.x
+        if [[ ! -f /etc/apt/sources.list.d/nodesource.list ]]; then
+            say "  Adding NodeSource repo for Node.js 26.x..."
+            curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+                | gpg --dearmor -o /usr/share/keyrings/nodesource.gpg 2>>"$LOG"
+            echo "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_26.x nodistro main" \
+                > /etc/apt/sources.list.d/nodesource.list
+        fi
+
+        # deadsnakes PPA for Python 3.15
+        if ! grep -rq "deadsnakes" /etc/apt/sources.list.d/ 2>/dev/null; then
+            say "  Adding deadsnakes PPA for Python 3.15..."
+            apt-get install -y software-properties-common >>"$LOG" 2>&1
+            add-apt-repository -y ppa:deadsnakes/ppa >>"$LOG" 2>&1
+        fi
+
+        # Ondřej Surý's PPA for PHP 8.5
+        if ! grep -rq "ondrej" /etc/apt/sources.list.d/ 2>/dev/null; then
+            say "  Adding ondrej/php PPA for PHP 8.5..."
+            apt-get install -y software-properties-common lsb-release ca-certificates >>"$LOG" 2>&1
+            add-apt-repository -y ppa:ondrej/php >>"$LOG" 2>&1
+        fi
+    fi
+
+    if [[ "$PM" == "dnf" || "$PM" == "yum" ]]; then
+        # NodeSource for RHEL/Fedora
+        if ! rpm -q nodesource-release >/dev/null 2>&1; then
+            curl -fsSL https://rpm.nodesource.com/setup_26.x | bash - >>"$LOG" 2>&1
+        fi
+        # Remi for PHP 8.5 (Fedora/RHEL)
+        if ! rpm -q remi-release >/dev/null 2>&1; then
+            dnf install -y https://rpms.remirepo.net/enterprise/remi-release-$(rpm -E %rhel 2>/dev/null || echo 9).rpm >>"$LOG" 2>&1 || true
+            dnf module reset -y php >>"$LOG" 2>&1 || true
+            dnf module enable -y php:remi-8.5 >>"$LOG" 2>&1 || true
+        fi
+    fi
+
+    # Refresh package indexes once
+    case "$PM" in
+        apt)    apt-get update -y >>"$LOG" 2>&1 ;;
+        dnf)    dnf makecache -y   >>"$LOG" 2>&1 ;;
+        yum)    yum makecache -y   >>"$LOG" 2>&1 ;;
+        zypper) zypper --non-interactive refresh >>"$LOG" 2>&1 ;;
+    esac
+
+    for entry in "${TOOLS[@]}"; do
+        IFS='|' read -r name cmd flag pkg <<< "$entry"
+        if [[ "${FOUND[$name]}" != "1" ]]; then
+            printf "  ${D}[SKIP]${N}       %-15s  not installed - skipping\n" "$name" | tee -a "$LOG"
+            continue
+        fi
+        target="${TARGET[$name]}"
+        printf "  ${C}[UPDATING]${N}   %-15s  current: %s   ${D}(target: %s)${N}\n" "$name" "${OLD_VER[$name]}" "${target:-latest}" | tee -a "$LOG"
+        case "$PM" in
+            apt)
+                # Try pinned version first (apt uses pkg=version syntax)
+                if [[ -n "$target" ]]; then
+                    DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades \
+                        "$pkg=${target}*" >>"$LOG" 2>&1
+                    rc=$?
+                    # PHP 8.5 fallback -> 8.4 branch
+                    if [[ $rc -ne 0 && "$name" == "PHP" ]]; then
+                        say "               PHP $target unavailable - trying ${PHP_FALLBACK_PKG}=${PHP_FALLBACK_VER}"
+                        DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades \
+                            "${PHP_FALLBACK_PKG}=${PHP_FALLBACK_VER}*" >>"$LOG" 2>&1
+                        rc=$?
+                    fi
+                    if [[ $rc -ne 0 ]]; then
+                        DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade "$pkg" >>"$LOG" 2>&1 \
+                          || DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >>"$LOG" 2>&1
+                    fi
+                else
+                    DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade "$pkg" >>"$LOG" 2>&1 \
+                      || DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >>"$LOG" 2>&1
+                fi
+                ;;
+            dnf)
+                if [[ -n "$target" ]]; then
+                    dnf install -y "${pkg}-${target}" >>"$LOG" 2>&1 || dnf upgrade -y "$pkg" >>"$LOG" 2>&1
+                else
+                    dnf upgrade -y "$pkg" >>"$LOG" 2>&1
+                fi
+                ;;
+            yum)    yum update -y "$pkg"  >>"$LOG" 2>&1 ;;
+            zypper) zypper --non-interactive update "$pkg" >>"$LOG" 2>&1 ;;
+            none)   say "${R}  No package manager - cannot update $name${N}" ;;
+        esac
+        # Re-detect version (python3.15 may now be the right binary)
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            case "$name" in
+                Python) cmd=python3 ;;
+                PHP)    cmd=php     ;;
+            esac
+        fi
+        NEW_VER[$name]=$("$cmd" "$flag" 2>/dev/null | head -n1)
+        if [[ "${NEW_VER[$name]}" == "${OLD_VER[$name]}" ]]; then
+            printf "               ${D}Already latest: %s${N}\n" "${NEW_VER[$name]}" | tee -a "$LOG"
+        else
+            printf "               ${G}UPDATED  %s  ->  %s${N}\n" "${OLD_VER[$name]}" "${NEW_VER[$name]}" | tee -a "$LOG"
+        fi
+    done
 fi
 
-echo "" | tee -a "$LOG"
-echo "----------------------------------------------" | tee -a "$LOG"
-echo " Old version : $OLD_VER"                        | tee -a "$LOG"
-echo " New version : $NEW_VER"                        | tee -a "$LOG"
-if [[ "$OLD_VER" == "$NEW_VER" ]]; then
-    echo " Status      : No change (already latest)"  | tee -a "$LOG"
-else
-    echo " Status      : UPDATED  $OLD_VER  ->  $NEW_VER" | tee -a "$LOG"
-fi
-echo "----------------------------------------------" | tee -a "$LOG"
-
-log "===== Chrome update finished OK ====="
-exit 0
+# ---------- SUMMARY ----------
+say ""
+say "${Y}>>> SUMMARY${N}"
+line
+printf "  %-15s %-10s %-35s %s\n" "Tool" "Status" "Old Version" "New Version" | tee -a "$LOG"
+line
+for entry in "${TOOLS[@]}"; do
+    IFS='|' read -r name _ _ _ <<< "$entry"
+    status=$([[ "${FOUND[$name]}" == "1" ]] && echo "FOUND" || echo "MISSING")
+    new="${NEW_VER[$name]:--}"
+    printf "  %-15s %-10s %-35s %s\n" "$name" "$status" "${OLD_VER[$name]}" "$new" | tee -a "$LOG"
+done
+line
+say "Full log: $LOG"
+say ""
