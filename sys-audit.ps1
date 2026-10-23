@@ -70,11 +70,27 @@ function Get-ExeVersion($paths) {
 }
 
 function Get-ChromeVersion {
-    return Get-ExeVersion @(
+    $exe = Get-ExeVersion @(
         "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
         "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
         "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
     )
+    if (-not $exe.Installed) { return $exe }
+    # Prefer the registry 'pv' value if newer (= update staged)
+    $regPaths = @(
+        "HKLM:\SOFTWARE\Google\Update\Clients\{8A69D345-D564-463C-AFF1-A69D9E530F96}",
+        "HKLM:\SOFTWARE\WOW6432Node\Google\Update\Clients\{8A69D345-D564-463C-AFF1-A69D9E530F96}"
+    )
+    foreach ($rp in $regPaths) {
+        if (Test-Path $rp) {
+            $pv = (Get-ItemProperty $rp -ErrorAction SilentlyContinue).pv
+            if ($pv -and ($pv -ne $exe.Version)) {
+                # Return the registry version (= staged latest, applies on next full restart)
+                return @{ Installed = $true; Version = $pv }
+            }
+        }
+    }
+    return $exe
 }
 function Get-FirefoxVersion {
     return Get-ExeVersion @(
@@ -92,8 +108,21 @@ function Get-EdgeVersion {
 function Get-CliVersion($cmd) {
     $g = Get-Command $cmd -ErrorAction SilentlyContinue
     if (-not $g) { return @{ Installed = $false; Version = $null } }
+
+    # Reject the Microsoft Store app-execution-alias stub (empty Python/Node that opens the Store)
+    $src = "$($g.Source)"
+    if ($src -like "*WindowsApps*AppInstaller*" -or $src -like "*WindowsApps\Microsoft.*") {
+        # Try to read the alias target; if it's a reparse-point stub with 0 bytes it's not real
+        if ((Test-Path $src) -and (Get-Item $src).Length -lt 1024) {
+            return @{ Installed = $false; Version = $null }
+        }
+    }
+
     $raw = & $cmd --version 2>&1 | Select-Object -First 1
-    return @{ Installed = $true; Version = "$raw".Trim() }
+    if (-not $raw) { $raw = & $cmd -V 2>&1 | Select-Object -First 1 }
+    $v = "$raw".Trim()
+    if (-not $v) { return @{ Installed = $false; Version = $null } }
+    return @{ Installed = $true; Version = $v }
 }
 
 # ---------- PHASE 1: AUDIT ----------
@@ -106,7 +135,18 @@ for ($i = 0; $i -lt $Names.Count; $i++) {
         'chrome'  { $info = Get-ChromeVersion }
         'firefox' { $info = Get-FirefoxVersion }
         'edge'    { $info = Get-EdgeVersion }
-        default   { $info = Get-CliVersion $Cmds[$i] }
+        default   {
+            $info = Get-CliVersion $Cmds[$i]
+            # Node may be installed as 'nodejs' on some systems
+            if (-not $info.Installed -and $Cmds[$i] -eq 'node') {
+                $info = Get-CliVersion 'nodejs'
+            }
+            # Python aliases: python3, py
+            if (-not $info.Installed -and $Cmds[$i] -eq 'python') {
+                $info = Get-CliVersion 'python3'
+                if (-not $info.Installed) { $info = Get-CliVersion 'py' }
+            }
+        }
     }
     $Found[$i]  = $info.Installed
     if ($info.Installed) {
