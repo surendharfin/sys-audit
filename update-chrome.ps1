@@ -34,9 +34,15 @@ $Names   = @('Google Chrome','Mozilla Firefox','Microsoft Edge','Node.js','Pytho
 $Detect  = @('chrome','firefox','edge','cli','cli','cli')
 $Cmds    = @($null,$null,$null,'node','python','php')
 $Winget  = @('Google.Chrome','Mozilla.Firefox','Microsoft.Edge','OpenJS.NodeJS','Python.Python.3.15','PHP.PHP.8.5')
-$Target  = @($null,$null,$null,'26.12.1','3.14.9','8.5.12')
+$Target  = @('156.0.8078.48',$null,$null,'26.12.1','3.14.9','8.5.12')
 # PHP fallback target (used only if 8.5.12 isn't in winget yet)
 $PhpFallback = '8.4.27'
+
+# Chrome: version 156.x is Beta/Early-Stable (Stable is still 155.x)
+# Direct enterprise MSI by channel:
+$ChromeStableMsi = 'https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi'
+$ChromeBetaMsi   = 'https://dl.google.com/chrome/install/beta/googlechromebetastandaloneenterprise64.msi'
+$ChromeDevMsi    = 'https://dl.google.com/chrome/install/dev/googlechromedevstandaloneenterprise64.msi'
 
 # Parallel result arrays (CLM-safe)
 $Found   = @($false,$false,$false,$false,$false,$false)
@@ -124,13 +130,34 @@ for ($i = 0; $i -lt $Names.Count; $i++) {
 
     switch ($Detect[$i]) {
         'chrome' {
-            $gu = "${env:ProgramFiles(x86)}\Google\Update\GoogleUpdate.exe"
-            if (Test-Path $gu) {
-                & $gu /ua /installsource scheduler
-                Start-Sleep -Seconds 3
-                Say "               Google Update triggered (no admin needed)." DarkGray
-            } elseif ($hasWinget) {
-                winget upgrade --id $Winget[$i] --silent --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
+            $t = $Target[$i]
+            if ($t -and $t.Split('.')[0] -ne $OldVer[$i].Split('.')[0]) {
+                # Different major -> pin via channel-specific MSI
+                $major = [int]$t.Split('.')[0]
+                if ($major -ge 157)      { $msiUrl = $ChromeDevMsi;    $channel = 'Dev'    }
+                elseif ($major -ge 156)  { $msiUrl = $ChromeBetaMsi;   $channel = 'Beta'   }
+                else                     { $msiUrl = $ChromeStableMsi; $channel = 'Stable' }
+
+                Say "               Target $t is on $channel channel; downloading MSI..." DarkGray
+                $msi = Join-Path $env:TEMP "chrome-$channel.msi"
+                try {
+                    Invoke-WebRequest -Uri $msiUrl -OutFile $msi -UseBasicParsing
+                    Say "               Downloaded $([math]::Round((Get-Item $msi).Length / 1MB, 1)) MB" DarkGray
+                    Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+                    Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart REBOOT=ReallySuppress" -Wait -Verb RunAs
+                    Say "               Install triggered (UAC prompt required)." DarkGray
+                } catch {
+                    Say "               Download failed: $($_.Exception.Message)" Red
+                }
+            } else {
+                $gu = "${env:ProgramFiles(x86)}\Google\Update\GoogleUpdate.exe"
+                if (Test-Path $gu) {
+                    & $gu /ua /installsource scheduler
+                    Start-Sleep -Seconds 3
+                    Say "               Google Update triggered (no admin needed)." DarkGray
+                } elseif ($hasWinget) {
+                    winget upgrade --id $Winget[$i] --silent --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
+                }
             }
         }
         'edge' {
