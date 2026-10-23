@@ -187,24 +187,48 @@ for ($i = 0; $i -lt $Names.Count; $i++) {
 
     switch ($Detect[$i]) {
         'chrome' {
-            $gu = "${env:ProgramFiles(x86)}\Google\Update\GoogleUpdate.exe"
-            if (Test-Path $gu) {
-                & $gu /ua /installsource scheduler
-                Start-Sleep -Seconds 3
-                Say "               Google Update triggered (no admin needed)." DarkGray
-            } elseif ($hasWinget) {
-                winget upgrade --id $Winget[$i] --silent --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
+            # Preferred: SYSTEM-level scheduled task (actually installs, no admin needed from user)
+            $taskNames = @('GoogleUpdateTaskMachineUA','GoogleUpdateTaskMachineCore','GoogleUpdaterTaskSystem')
+            $taskRun = $false
+            foreach ($tn in $taskNames) {
+                $t = Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
+                if ($t) {
+                    Start-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
+                    Say "               Scheduled task '$tn' started (runs as SYSTEM, installs latest)." DarkGray
+                    $taskRun = $true
+                    break
+                }
             }
+            if (-not $taskRun) {
+                $gu = "${env:ProgramFiles(x86)}\Google\Update\GoogleUpdate.exe"
+                if (Test-Path $gu) {
+                    & $gu /ua /installsource scheduler
+                    Say "               GoogleUpdate.exe /ua triggered (may need SYSTEM to actually install)." DarkGray
+                }
+            }
+            # Wait longer so the SYSTEM task has time to download+stage
+            Start-Sleep -Seconds 15
         }
         'edge' {
-            $eu = "${env:ProgramFiles(x86)}\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe"
-            if (Test-Path $eu) {
-                & $eu /ua /installsource scheduler
-                Start-Sleep -Seconds 3
-                Say "               Microsoft Edge Update triggered (no admin needed)." DarkGray
-            } elseif ($hasWinget) {
-                winget upgrade --id $Winget[$i] --silent --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
+            $taskNames = @('MicrosoftEdgeUpdateTaskMachineUA','MicrosoftEdgeUpdateTaskMachineCore')
+            $taskRun = $false
+            foreach ($tn in $taskNames) {
+                $t = Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
+                if ($t) {
+                    Start-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
+                    Say "               Scheduled task '$tn' started (runs as SYSTEM, installs latest)." DarkGray
+                    $taskRun = $true
+                    break
+                }
             }
+            if (-not $taskRun) {
+                $eu = "${env:ProgramFiles(x86)}\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe"
+                if (Test-Path $eu) {
+                    & $eu /ua /installsource scheduler
+                    Say "               MicrosoftEdgeUpdate.exe /ua triggered." DarkGray
+                }
+            }
+            Start-Sleep -Seconds 15
         }
         'firefox' {
             if ($hasWinget) {
@@ -244,7 +268,6 @@ for ($i = 0; $i -lt $Names.Count; $i++) {
         }
     }
 
-    Start-Sleep -Seconds 2
     switch ($Detect[$i]) {
         'chrome'  { $after = Get-ChromeVersion }
         'firefox' { $after = Get-FirefoxVersion }
@@ -253,8 +276,20 @@ for ($i = 0; $i -lt $Names.Count; $i++) {
     }
     if ($after.Version) { $NewVer[$i] = $after.Version }
 
+    # For Chrome: check registry 'pv' - if newer than exe, update is downloaded but needs restart
+    if ($Detect[$i] -eq 'chrome') {
+        $pv = (Get-ItemProperty "HKLM:\SOFTWARE\WOW6432Node\Google\Update\Clients\{8A69D345-D564-463C-AFF1-A69D9E530F96}" -ErrorAction SilentlyContinue).pv
+        if (-not $pv) {
+            $pv = (Get-ItemProperty "HKLM:\SOFTWARE\Google\Update\Clients\{8A69D345-D564-463C-AFF1-A69D9E530F96}" -ErrorAction SilentlyContinue).pv
+        }
+        if ($pv -and ($pv -ne $NewVer[$i])) {
+            Say ("               Update staged: $pv  (apply by closing ALL Chrome windows + tray, then reopen)") Yellow
+            $NewVer[$i] = $pv
+        }
+    }
+
     if ($NewVer[$i] -eq $OldVer[$i]) {
-        Say ("               No change or update staged: {0}" -f $NewVer[$i]) DarkGray
+        Say ("               No change: {0}" -f $NewVer[$i]) DarkGray
     } else {
         Say ("               UPDATED  {0}  ->  {1}" -f $OldVer[$i], $NewVer[$i]) Green
     }
