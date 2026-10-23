@@ -57,11 +57,25 @@ $NewVer  = @('-','-','-','-','-','-')
 function Get-ExeVersion($paths) {
     foreach ($p in $paths) {
         if (Test-Path $p) {
-            $v = (Get-Item $p).VersionInfo.ProductVersion
-            if ($v) { return @{ Installed = $true; Version = $v } }
+            $item = Get-Item $p
+            $vi   = $item.VersionInfo
+            $v    = $null
+            if ($vi) {
+                if ($vi.ProductVersion)  { $v = "$($vi.ProductVersion)".Trim() }
+                if (-not $v -and $vi.FileVersion) { $v = "$($vi.FileVersion)".Trim() }
+            }
+            # Fallback: Chrome/Edge store a version-named subdir next to chrome.exe
+            if (-not $v) {
+                $appDir = Split-Path $p -Parent
+                $subdirs = Get-ChildItem $appDir -Directory -ErrorAction SilentlyContinue |
+                           Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+                           Sort-Object Name -Descending
+                if ($subdirs) { $v = $subdirs[0].Name }
+            }
+            if ($v) { return @{ Installed = $true; Version = $v; Path = $p } }
         }
     }
-    return @{ Installed = $false; Version = $null }
+    return @{ Installed = $false; Version = $null; Path = $null }
 }
 
 function Get-ChromeVersion {
