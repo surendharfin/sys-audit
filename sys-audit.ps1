@@ -70,7 +70,7 @@ function Get-ExeVersion($paths) {
 }
 
 function Get-ChromeVersion {
-    # Check Stable first, then Beta, then Dev - whichever is newest wins
+    # Scan all channels - pick the highest version found
     $candidates = @(
         "$env:ProgramFiles\Google\Chrome Beta\Application\chrome.exe",
         "${env:ProgramFiles(x86)}\Google\Chrome Beta\Application\chrome.exe",
@@ -80,23 +80,40 @@ function Get-ChromeVersion {
         "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
         "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
     )
-    $exe = Get-ExeVersion $candidates
-    if (-not $exe.Installed) { return $exe }
-    # Prefer the registry 'pv' value if newer (= update staged)
-    $regPaths = @(
-        "HKLM:\SOFTWARE\Google\Update\Clients\{8A69D345-D564-463C-AFF1-A69D9E530F96}",
-        "HKLM:\SOFTWARE\WOW6432Node\Google\Update\Clients\{8A69D345-D564-463C-AFF1-A69D9E530F96}"
-    )
-    foreach ($rp in $regPaths) {
-        if (Test-Path $rp) {
-            $pv = (Get-ItemProperty $rp -ErrorAction SilentlyContinue).pv
-            if ($pv -and ($pv -ne $exe.Version)) {
-                # Return the registry version (= staged latest, applies on next full restart)
-                return @{ Installed = $true; Version = $pv }
+    $best = $null
+    $bestPath = $null
+    foreach ($p in $candidates) {
+        if (Test-Path $p) {
+            $v = (Get-Item $p).VersionInfo.ProductVersion
+            if ($v) {
+                if (-not $best) { $best = $v; $bestPath = $p; continue }
+                # Compare as [version] when possible
+                $vA = $v     -as [version]
+                $vB = $best  -as [version]
+                if ($vA -and $vB -and $vA -gt $vB) { $best = $v; $bestPath = $p }
             }
         }
     }
-    return $exe
+    if (-not $best) { return @{ Installed = $false; Version = $null } }
+
+    # If we're on Stable (and only Stable), also consult registry pv for staged updates
+    if ($bestPath -notlike "*Chrome Beta*" -and $bestPath -notlike "*Chrome Dev*") {
+        $regPaths = @(
+            "HKLM:\SOFTWARE\Google\Update\Clients\{8A69D345-D564-463C-AFF1-A69D9E530F96}",
+            "HKLM:\SOFTWARE\WOW6432Node\Google\Update\Clients\{8A69D345-D564-463C-AFF1-A69D9E530F96}"
+        )
+        foreach ($rp in $regPaths) {
+            if (Test-Path $rp) {
+                $pv = (Get-ItemProperty $rp -ErrorAction SilentlyContinue).pv
+                if ($pv) {
+                    $vA = $pv  -as [version]
+                    $vB = $best -as [version]
+                    if ($vA -and $vB -and $vA -gt $vB) { $best = $pv }
+                }
+            }
+        }
+    }
+    return @{ Installed = $true; Version = $best }
 }
 function Get-FirefoxVersion {
     return Get-ExeVersion @(
