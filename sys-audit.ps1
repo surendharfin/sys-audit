@@ -115,6 +115,68 @@ function Get-EdgeVersion {
         "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe"
     )
 }
+function Download-Fast($url, $dest) {
+    if (Test-Path $dest) { Remove-Item $dest -Force -ErrorAction SilentlyContinue }
+    try {
+        Import-Module BitsTransfer -ErrorAction Stop
+        Start-BitsTransfer -Source $url -Destination $dest -Priority Foreground -ErrorAction Stop
+        if ((Test-Path $dest) -and (Get-Item $dest).Length -gt 50MB) { return $true }
+    } catch { }
+    if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
+        & curl.exe -L --http2 --compressed --fail -o $dest $url 2>&1 | Out-Null
+        if ((Test-Path $dest) -and (Get-Item $dest).Length -gt 50MB) { return $true }
+    }
+    try { Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing; return $true } catch { return $false }
+}
+
+function Install-ChromeStableLatest {
+    Say "               Scheduled task path failed - trying direct MSI install (UAC required)..." Yellow
+    $url = 'https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi'
+    $msi = "$env:TEMP\chrome-stable.msi"
+    $sw  = Get-Date
+    if (-not (Download-Fast $url $msi)) {
+        Say "               Download failed. Check proxy/firewall." Red; return
+    }
+    $mb   = "{0:N1}" -f ((Get-Item $msi).Length / 1MB)
+    $secs = "{0:N1}" -f ((Get-Date) - $sw).TotalSeconds
+    Say "               Downloaded $mb MB in ${secs}s" Green
+    Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    try {
+        $p = Start-Process msiexec.exe `
+             -ArgumentList "/i `"$msi`" /qn /norestart REBOOT=ReallySuppress" `
+             -Verb RunAs -Wait -PassThru -ErrorAction Stop
+        Say "               msiexec exit code: $($p.ExitCode)" DarkGray
+    } catch {
+        Say "               UAC denied or run as Administrator to install." Red
+    }
+    Remove-Item $msi -Force -ErrorAction SilentlyContinue
+}
+
+function Install-EdgeStableLatest {
+    Say "               Scheduled task path failed - trying direct MSI install (UAC required)..." Yellow
+    $url = 'https://go.microsoft.com/fwlink/?linkid=2093437'
+    $msi = "$env:TEMP\edge-stable.msi"
+    $sw  = Get-Date
+    if (-not (Download-Fast $url $msi)) {
+        Say "               Download failed. Check proxy/firewall." Red; return
+    }
+    $mb   = "{0:N1}" -f ((Get-Item $msi).Length / 1MB)
+    $secs = "{0:N1}" -f ((Get-Date) - $sw).TotalSeconds
+    Say "               Downloaded $mb MB in ${secs}s" Green
+    Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    try {
+        $p = Start-Process msiexec.exe `
+             -ArgumentList "/i `"$msi`" /qn /norestart REBOOT=ReallySuppress" `
+             -Verb RunAs -Wait -PassThru -ErrorAction Stop
+        Say "               msiexec exit code: $($p.ExitCode)" DarkGray
+    } catch {
+        Say "               UAC denied or run as Administrator to install." Red
+    }
+    Remove-Item $msi -Force -ErrorAction SilentlyContinue
+}
+
 function Get-CliVersion($cmd) {
     $g = Get-Command $cmd -ErrorAction SilentlyContinue
     if (-not $g) { return @{ Installed = $false; Version = $null } }
@@ -201,48 +263,46 @@ for ($i = 0; $i -lt $Names.Count; $i++) {
 
     switch ($Detect[$i]) {
         'chrome' {
-            # Preferred: SYSTEM-level scheduled task (actually installs, no admin needed from user)
-            $taskNames = @('GoogleUpdateTaskMachineUA','GoogleUpdateTaskMachineCore','GoogleUpdaterTaskSystem')
-            $taskRun = $false
-            foreach ($tn in $taskNames) {
-                $t = Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
-                if ($t) {
-                    Start-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
-                    Say "               Scheduled task '$tn' started (runs as SYSTEM, installs latest)." DarkGray
-                    $taskRun = $true
-                    break
+            $tryTask = {
+                $taskRun = $false
+                foreach ($tn in @('GoogleUpdateTaskMachineUA','GoogleUpdateTaskMachineCore','GoogleUpdaterTaskSystem')) {
+                    $t = Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
+                    if ($t) {
+                        try { Start-ScheduledTask -TaskName $tn -ErrorAction Stop; return $tn } catch { }
+                    }
                 }
+                return $null
             }
-            if (-not $taskRun) {
-                $gu = "${env:ProgramFiles(x86)}\Google\Update\GoogleUpdate.exe"
-                if (Test-Path $gu) {
-                    & $gu /ua /installsource scheduler
-                    Say "               GoogleUpdate.exe /ua triggered (may need SYSTEM to actually install)." DarkGray
-                }
+            $ran = & $tryTask
+            if ($ran) {
+                Say "               Scheduled task '$ran' started (SYSTEM). Waiting..." DarkGray
+                Start-Sleep -Seconds 20
             }
-            # Wait longer so the SYSTEM task has time to download+stage
-            Start-Sleep -Seconds 15
+            # Fallback: direct MSI install (needs admin)
+            $after = Get-ChromeVersion
+            if ($after.Version -eq $OldVer[$i]) {
+                Install-ChromeStableLatest
+            }
         }
         'edge' {
-            $taskNames = @('MicrosoftEdgeUpdateTaskMachineUA','MicrosoftEdgeUpdateTaskMachineCore')
-            $taskRun = $false
-            foreach ($tn in $taskNames) {
-                $t = Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
-                if ($t) {
-                    Start-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
-                    Say "               Scheduled task '$tn' started (runs as SYSTEM, installs latest)." DarkGray
-                    $taskRun = $true
-                    break
+            $tryTask = {
+                foreach ($tn in @('MicrosoftEdgeUpdateTaskMachineUA','MicrosoftEdgeUpdateTaskMachineCore')) {
+                    $t = Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
+                    if ($t) {
+                        try { Start-ScheduledTask -TaskName $tn -ErrorAction Stop; return $tn } catch { }
+                    }
                 }
+                return $null
             }
-            if (-not $taskRun) {
-                $eu = "${env:ProgramFiles(x86)}\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe"
-                if (Test-Path $eu) {
-                    & $eu /ua /installsource scheduler
-                    Say "               MicrosoftEdgeUpdate.exe /ua triggered." DarkGray
-                }
+            $ran = & $tryTask
+            if ($ran) {
+                Say "               Scheduled task '$ran' started (SYSTEM). Waiting..." DarkGray
+                Start-Sleep -Seconds 20
             }
-            Start-Sleep -Seconds 15
+            $after = Get-EdgeVersion
+            if ($after.Version -eq $OldVer[$i]) {
+                Install-EdgeStableLatest
+            }
         }
         'firefox' {
             if ($hasWinget) {
