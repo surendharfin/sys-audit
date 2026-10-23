@@ -185,6 +185,91 @@ function Install-ChromeStableLatest {
     Remove-Item $msi -Force -ErrorAction SilentlyContinue
 }
 
+function Install-NodeExact($ver) {
+    if (-not $ver) { return }
+    Say "               Downloading Node.js $ver MSI from nodejs.org..." Yellow
+    $url = "https://nodejs.org/dist/v$ver/node-v$ver-x64.msi"
+    $msi = "$env:TEMP\node-$ver.msi"
+    if (-not (Download-Fast $url $msi)) {
+        Say "               Node.js $ver download failed - may not exist yet." Red
+        return
+    }
+    $mb = "{0:N1}" -f ((Get-Item $msi).Length / 1MB)
+    Say "               Downloaded $mb MB" Green
+    $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru -NoNewWindow
+    Say "               Node.js msiexec exit code: $($p.ExitCode)" DarkGray
+    Remove-Item $msi -Force -ErrorAction SilentlyContinue
+    # Refresh PATH so the just-installed node is visible to post-check
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+}
+
+function Install-PythonExact($ver) {
+    if (-not $ver) { return }
+    Say "               Downloading Python $ver from python.org..." Yellow
+    $url = "https://www.python.org/ftp/python/$ver/python-$ver-amd64.exe"
+    $exe = "$env:TEMP\python-$ver.exe"
+    if (-not (Download-Fast $url $exe)) {
+        Say "               Python $ver download failed - may not exist yet." Red
+        return
+    }
+    $mb = "{0:N1}" -f ((Get-Item $exe).Length / 1MB)
+    Say "               Downloaded $mb MB" Green
+    $p = Start-Process $exe -ArgumentList "/quiet","InstallAllUsers=1","PrependPath=1","Include_test=0" -Wait -PassThru -NoNewWindow
+    Say "               Python installer exit code: $($p.ExitCode)" DarkGray
+    Remove-Item $exe -Force -ErrorAction SilentlyContinue
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+}
+
+function Install-PhpExact($ver) {
+    if (-not $ver) { return }
+    Say "               Downloading PHP $ver from windows.php.net..." Yellow
+    $url = "https://windows.php.net/downloads/releases/php-$ver-nts-Win32-vs17-x64.zip"
+    $zip = "$env:TEMP\php-$ver.zip"
+    if (-not (Download-Fast $url $zip)) {
+        # Try VS16 variant for older builds
+        $url = "https://windows.php.net/downloads/releases/php-$ver-nts-Win32-vs16-x64.zip"
+        if (-not (Download-Fast $url $zip)) {
+            Say "               PHP $ver download failed - may not exist yet." Red
+            return
+        }
+    }
+    $mb = "{0:N1}" -f ((Get-Item $zip).Length / 1MB)
+    Say "               Downloaded $mb MB" Green
+    $dest = "C:\PHP"
+    if (Test-Path $dest) {
+        $backup = "C:\PHP.old"
+        if (Test-Path $backup) { Remove-Item $backup -Recurse -Force -ErrorAction SilentlyContinue }
+        Rename-Item $dest $backup -ErrorAction SilentlyContinue
+    }
+    Expand-Archive -Path $zip -DestinationPath $dest -Force
+    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    # Add C:\PHP to system PATH if not present
+    $machinePath = [System.Environment]::GetEnvironmentVariable("Path","Machine")
+    if ($machinePath -notlike "*C:\PHP*") {
+        [System.Environment]::SetEnvironmentVariable("Path", "$machinePath;C:\PHP", "Machine")
+    }
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+    Say "               PHP $ver extracted to C:\PHP (added to PATH)" Green
+}
+
+function Install-EdgeExact($ver) {
+    # Microsoft doesn't expose per-version MSIs reliably; use latest Enterprise MSI (currently 156.x)
+    Say "               Downloading Microsoft Edge Enterprise MSI..." Yellow
+    $url = 'https://go.microsoft.com/fwlink/?linkid=2093437'
+    $msi = "$env:TEMP\edge.msi"
+    if (-not (Download-Fast $url $msi)) {
+        Say "               Download failed." Red
+        return
+    }
+    $mb = "{0:N1}" -f ((Get-Item $msi).Length / 1MB)
+    Say "               Downloaded $mb MB" Green
+    Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart REBOOT=ReallySuppress" -Wait -PassThru -NoNewWindow
+    Say "               Edge msiexec exit code: $($p.ExitCode)" DarkGray
+    Remove-Item $msi -Force -ErrorAction SilentlyContinue
+}
+
 function Install-FirefoxExact($ver) {
     if (-not $ver) { return }
     Say "               Downloading Firefox $ver installer from Mozilla..." Yellow
@@ -407,7 +492,7 @@ for ($i = 0; $i -lt $Names.Count; $i++) {
             }
             $after = Get-EdgeVersion
             if ($after.Version -eq $OldVer[$i]) {
-                Install-EdgeStableLatest
+                Install-EdgeExact $Target[$i]
             }
         }
         'firefox' {
@@ -420,32 +505,34 @@ for ($i = 0; $i -lt $Names.Count; $i++) {
             }
         }
         default {
-            if ($hasWinget) {
-                $t  = $Target[$i]
+            $t = $Target[$i]
+            # Try winget first if available
+            if ($hasWinget -and $t) {
                 $id = $Winget[$i]
-
-                if ($Names[$i] -eq 'PHP' -and $t) {
+                if ($Names[$i] -eq 'PHP') {
                     $branch = ($t -split '\.')[0..1] -join '.'
                     $id = "PHP.PHP.$branch"
                 }
-                if ($Names[$i] -eq 'Node.js' -and $t) {
+                if ($Names[$i] -eq 'Node.js') {
                     $major = [int](($t -split '\.')[0])
                     if ($major -in 22,24,26) { $id = 'OpenJS.NodeJS.LTS' } else { $id = 'OpenJS.NodeJS' }
                 }
+                Say "               Trying winget: $id version $t" DarkGray
+                winget install --id $id --version $t --silent --accept-source-agreements --accept-package-agreements --force 2>&1 | Out-Null
+            }
 
-                if ($t) {
-                    Say "               Target: $t (winget id: $id)" DarkGray
-                    winget install --id $id --version $t --silent --accept-source-agreements --accept-package-agreements --force 2>&1 | Out-Null
-                    if ($LASTEXITCODE -ne 0) {
-                        Say "               Pinned $t unavailable - falling back to latest in branch." DarkGray
-                        winget upgrade --id $id --silent --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
-                    }
-                } else {
-                    winget upgrade --id $id --silent --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
+            # Check if winget succeeded; if not (or winget missing), use direct installer
+            Start-Sleep -Seconds 2
+            $after = Get-CliVersion $Cmds[$i]
+            $cleanBefore = ($OldVer[$i] -replace '[^\d.]','')
+            $cleanAfter  = ("$($after.Version)" -replace '[^\d.]','')
+            if ($t -and $cleanAfter -notlike "*$t*") {
+                Say "               winget missed target ($cleanAfter vs $t) - using direct installer..." Yellow
+                switch ($Names[$i]) {
+                    'Node.js' { Install-NodeExact $t }
+                    'Python'  { Install-PythonExact $t }
+                    'PHP'     { Install-PhpExact $t }
                 }
-            } else {
-                Say "               No updater available (winget missing)." Red
-                continue
             }
         }
     }
