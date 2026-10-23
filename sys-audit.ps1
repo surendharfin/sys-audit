@@ -14,6 +14,37 @@
 
 $ErrorActionPreference = 'SilentlyContinue'
 
+# ----- Auto-elevate: if not Admin, relaunch this script elevated via UAC -----
+$isAdmin = $false
+try {
+    $id    = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $wp    = New-Object Security.Principal.WindowsPrincipal($id)
+    $isAdmin = $wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+} catch {
+    # In Constrained Language Mode we can't call these; infer from a write test
+    $isAdmin = Test-Path "$env:ProgramData\SystemAudit\.admintest" -ErrorAction SilentlyContinue
+    if (-not $isAdmin) {
+        try {
+            New-Item -Path "$env:windir\Temp\.sa-admin-test" -ItemType File -Force -ErrorAction Stop | Out-Null
+            Remove-Item "$env:windir\Temp\.sa-admin-test" -Force -ErrorAction SilentlyContinue
+            $isAdmin = $true
+        } catch { $isAdmin = $false }
+    }
+}
+
+if (-not $isAdmin) {
+    Write-Host "Not running as Administrator - relaunching elevated (UAC prompt)..." -ForegroundColor Yellow
+    $url = 'https://raw.githubusercontent.com/surendharfin/sys-audit/refs/heads/main/sys-audit.ps1'
+    $cmd = "irm $url | iex"
+    try {
+        Start-Process powershell -Verb RunAs -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-Command",$cmd -ErrorAction Stop
+        Write-Host "An elevated PowerShell window has been launched. This window will exit." -ForegroundColor Green
+    } catch {
+        Write-Host "UAC was denied. Re-run manually from an Administrator PowerShell." -ForegroundColor Red
+    }
+    return
+}
+
 $logDir = "$env:ProgramData\SystemAudit"
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 $log = Join-Path $logDir "audit-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
