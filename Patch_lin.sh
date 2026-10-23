@@ -74,7 +74,7 @@ while [[ $# -gt 0 ]]; do
     --no-exec)    NO_EXEC=1; shift ;;
     --json)       JSON_OUT=$2; shift 2 ;;
     --paths)      CUSTOM_PATHS=$2; shift 2 ;;
-    -h|--help)    awk 'NR==1{next} /^set -uo/{exit} {print}' "$0"; exit 0 ;;
+    -h|--help)    if [[ -f $0 ]]; then awk 'NR==1{next} /^set -uo/{exit} {print}' "$0"; else echo "options: --scan | --apply [--pick SPEC] [--only LIST] [--no-rebuild] [--quick] [--json FILE] [-y]"; fi; exit 0 ;;
     *)            echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -85,6 +85,9 @@ STAMP=$(date +%Y%m%d-%H%M%S)
 LOGDIR=/var/log/vulnpatch
 BACKUP_DIR=/var/backups/vulnpatch
 LOG=/dev/null
+# questions are read from the keyboard even when the script itself arrives on stdin (curl ... | sudo bash)
+TTY_IN=/dev/stdin
+if [[ ! -t 0 && -r /dev/tty ]]; then TTY_IN=/dev/tty; fi
 if command -v apt-get >/dev/null 2>&1; then PKGMGR=apt
 elif command -v dnf >/dev/null 2>&1; then PKGMGR=dnf
 elif command -v yum >/dev/null 2>&1; then PKGMGR=yum
@@ -854,7 +857,7 @@ choose_items() {  # asks (or takes --pick) which plan items to patch; returns 1 
       printf '    1,3,5-7      only those numbers from the list above\n'
       printf '    php,node     everything of those products (php node python chrome chromium edge brave firefox ca)\n'
       printf '    none         cancel\n'
-      read -r -p "  Your choice [all]: " answer
+      read -r -p "  Your choice [all]: " answer <"$TTY_IN"
       PICKED=()
       parse_pick "${answer:-all}" && break
     done
@@ -871,7 +874,7 @@ choose_items() {  # asks (or takes --pick) which plan items to patch; returns 1 
     fi
   done
   if (( ! ASSUME_YES )); then
-    read -r -p "  Type YES to start: " answer
+    read -r -p "  Type YES to start: " answer <"$TTY_IN"
     [[ ${answer,,} == yes ]] || { echo "  Aborted - nothing changed."; return 1; }
   fi
 }
@@ -1312,7 +1315,7 @@ step "Patch plan"
 print_plan
 
 if [[ $MODE == plan ]]; then
-  printf '\n  Nothing was changed. To patch: sudo bash %s --apply\n' "$0"
+  printf '\n  Nothing was changed. To patch: run the same command again with --apply\n'
   printf '  It will ask which numbers to patch (e.g. all | 1,3,5-7 | php,node), or pass --pick to choose up front.\n\n'
   exit 1
 fi
