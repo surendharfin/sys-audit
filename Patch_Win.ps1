@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    vulnpatch-windows.ps1 - DETECT and PATCH in one file: the Windows counterpart of vulnpatch-linux.sh.
+    vulnpatch-windows.ps1 - DETECT and PATCH in one file: the Windows counterpart of vulnpatch-linux.sh
 
 .DESCRIPTION
     DETECT: finds EVERY copy of PHP, Node.js, Python, Chrome, Chromium, Edge, Firefox and Brave on this
