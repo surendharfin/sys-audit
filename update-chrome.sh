@@ -44,17 +44,33 @@ fi
 say "Package manager: ${C}${PM}${N}"
 
 # --- Tools to audit: name|command|version-flag|package-name|target-version ---
+# target-version is resolved per installed branch below for Node/PHP.
 TOOLS=(
     "Google Chrome|google-chrome|--version|google-chrome-beta|156.0.8078.48"
     "Mozilla Firefox|firefox|--version|firefox|"
     "Microsoft Edge|microsoft-edge|--version|microsoft-edge-stable|"
-    "Node.js|node|--version|nodejs|26.12.1"
+    "Node.js|node|--version|nodejs|"
     "Python|python3.14|--version|python3.14|3.14.9"
-    "PHP|php|--version|php8.5|8.5.12"
+    "PHP|php|--version|php|"
 )
-# PHP fallback (8.4 branch) if 8.5.12 is unavailable
-PHP_FALLBACK_PKG="php8.4"
-PHP_FALLBACK_VER="8.4.27"
+
+# Branch-aware targets: pick the right patch for the branch the user is on
+declare -A NODE_TARGETS=(
+    [22]="22.23.4"
+    [24]="24.22.1"
+    [26]="26.12.1"
+)
+declare -A PHP_TARGETS=(
+    [8.2]="8.2.35"
+    [8.3]="8.3.36"
+    [8.4]="8.4.27"
+    [8.5]="8.5.12"
+)
+
+# Helper: extract major from Node version like "v24.12.0"
+node_major() { echo "$1" | sed -E 's/^v?([0-9]+)\..*/\1/'; }
+# Helper: extract major.minor from PHP version like "PHP 8.5.4 (cli)..."
+php_branch() { echo "$1" | sed -E 's/^PHP ([0-9]+\.[0-9]+)\..*/\1/'; }
 
 declare -A OLD_VER NEW_VER FOUND PKG TARGET
 
@@ -65,9 +81,7 @@ line
 
 for entry in "${TOOLS[@]}"; do
     IFS='|' read -r name cmd flag pkg target <<< "$entry"
-    PKG[$name]=$pkg
-    TARGET[$name]=$target
-    # Also look up generic command for CLI tools (python3 / php) when pinned command isn't found
+    # Also look up generic command for CLI tools when pinned command isn't found
     if ! command -v "$cmd" >/dev/null 2>&1; then
         case "$name" in
             Python) cmd=python3 ;;
@@ -78,10 +92,29 @@ for entry in "${TOOLS[@]}"; do
         ver=$("$cmd" "$flag" 2>/dev/null | head -n1)
         FOUND[$name]=1
         OLD_VER[$name]="$ver"
+
+        # Branch-aware target resolution
+        case "$name" in
+            "Node.js")
+                maj=$(node_major "$ver")
+                [[ -n "${NODE_TARGETS[$maj]:-}" ]] && target="${NODE_TARGETS[$maj]}"
+                # pick package too: nodejs for NodeSource (any branch)
+                ;;
+            "PHP")
+                br=$(php_branch "$ver")
+                [[ -n "${PHP_TARGETS[$br]:-}" ]] && target="${PHP_TARGETS[$br]}"
+                pkg="php${br}"
+                ;;
+        esac
+        PKG[$name]=$pkg
+        TARGET[$name]=$target
+
         printf "  ${G}[FOUND]${N}      %-15s  version: %s   ${D}(target: %s)${N}\n" "$name" "$ver" "${target:-latest}" | tee -a "$LOG"
     else
         FOUND[$name]=0
         OLD_VER[$name]="-"
+        PKG[$name]=$pkg
+        TARGET[$name]=$target
         printf "  ${R}[NOT FOUND]${N}  %-15s  (not installed)   ${D}(target: %s)${N}\n" "$name" "${target:-latest}" | tee -a "$LOG"
     fi
 done
@@ -112,13 +145,16 @@ else
                 > /etc/apt/sources.list.d/microsoft-edge.list
         fi
 
-        # NodeSource for Node.js 26.x
-        if [[ ! -f /etc/apt/sources.list.d/nodesource.list ]]; then
-            say "  Adding NodeSource repo for Node.js 26.x..."
-            curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-                | gpg --dearmor -o /usr/share/keyrings/nodesource.gpg 2>>"$LOG"
-            echo "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_26.x nodistro main" \
-                > /etc/apt/sources.list.d/nodesource.list
+        # NodeSource for Node.js - repo matches the installed major
+        if [[ "${FOUND[Node.js]}" == "1" ]]; then
+            NODE_MAJ=$(node_major "${OLD_VER[Node.js]}")
+            if [[ ! -f /etc/apt/sources.list.d/nodesource.list ]] || ! grep -q "node_${NODE_MAJ}\.x" /etc/apt/sources.list.d/nodesource.list; then
+                say "  Adding/updating NodeSource repo for Node.js ${NODE_MAJ}.x..."
+                curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+                    | gpg --dearmor --yes -o /usr/share/keyrings/nodesource.gpg 2>>"$LOG"
+                echo "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJ}.x nodistro main" \
+                    > /etc/apt/sources.list.d/nodesource.list
+            fi
         fi
 
         # deadsnakes PPA for Python 3.15
@@ -137,9 +173,10 @@ else
     fi
 
     if [[ "$PM" == "dnf" || "$PM" == "yum" ]]; then
-        # NodeSource for RHEL/Fedora
-        if ! rpm -q nodesource-release >/dev/null 2>&1; then
-            curl -fsSL https://rpm.nodesource.com/setup_26.x | bash - >>"$LOG" 2>&1
+        # NodeSource for RHEL/Fedora - match installed major
+        if [[ "${FOUND[Node.js]}" == "1" ]] && ! rpm -q nodesource-release >/dev/null 2>&1; then
+            NODE_MAJ=$(node_major "${OLD_VER[Node.js]}")
+            curl -fsSL "https://rpm.nodesource.com/setup_${NODE_MAJ}.x" | bash - >>"$LOG" 2>&1
         fi
         # Remi for PHP 8.5 (Fedora/RHEL)
         if ! rpm -q remi-release >/dev/null 2>&1; then

@@ -34,9 +34,19 @@ $Names   = @('Google Chrome','Mozilla Firefox','Microsoft Edge','Node.js','Pytho
 $Detect  = @('chrome','firefox','edge','cli','cli','cli')
 $Cmds    = @($null,$null,$null,'node','python','php')
 $Winget  = @('Google.Chrome','Mozilla.Firefox','Microsoft.Edge','OpenJS.NodeJS','Python.Python.3.15','PHP.PHP.8.5')
-$Target  = @('156.0.8078.48',$null,$null,'26.12.1','3.14.9','8.5.12')
-# PHP fallback target (used only if 8.5.12 isn't in winget yet)
-$PhpFallback = '8.4.27'
+$Target  = @('156.0.8078.48',$null,$null,'',  '3.14.9','')
+# Branch-aware targets: pick the right patch for whichever major.minor the user is on
+$NodeTargets = @{
+    '22' = '22.23.4'
+    '24' = '24.22.1'
+    '26' = '26.12.1'
+}
+$PhpTargets = @{
+    '8.2' = '8.2.35'
+    '8.3' = '8.3.36'
+    '8.4' = '8.4.27'
+    '8.5' = '8.5.12'
+}
 
 # Chrome: version 156.x is Beta/Early-Stable (Stable is still 155.x)
 # Direct enterprise MSI by channel:
@@ -101,6 +111,23 @@ for ($i = 0; $i -lt $Names.Count; $i++) {
     $Found[$i]  = $info.Installed
     if ($info.Installed) {
         $OldVer[$i] = $info.Version
+
+        # Branch-aware target resolution
+        if ($Names[$i] -eq 'Node.js') {
+            $m = [regex]::Match($info.Version, 'v?(\d+)\.')
+            if ($m.Success) {
+                $major = $m.Groups[1].Value
+                if ($NodeTargets.ContainsKey($major)) { $Target[$i] = $NodeTargets[$major] }
+            }
+        }
+        elseif ($Names[$i] -eq 'PHP') {
+            $m = [regex]::Match($info.Version, '(\d+\.\d+)\.')
+            if ($m.Success) {
+                $branch = $m.Groups[1].Value
+                if ($PhpTargets.ContainsKey($branch)) { $Target[$i] = $PhpTargets[$branch] }
+            }
+        }
+
         $tgt = if ($Target[$i]) { "  (target: $($Target[$i]))" } else { '' }
         Say ("  [FOUND]      {0,-18}  version: {1}{2}" -f $Names[$i], $info.Version, $tgt) Green
     } else {
@@ -140,14 +167,47 @@ for ($i = 0; $i -lt $Names.Count; $i++) {
 
                 Say "               Target $t is on $channel channel; downloading MSI..." DarkGray
                 $msi = Join-Path $env:TEMP "chrome-$channel.msi"
+                $dlOk = $false
+                $sw = Get-Date
+
+                # Method 1: BITS (fastest - uses Microsoft's background transfer service, multi-connection, resumable)
                 try {
-                    Invoke-WebRequest -Uri $msiUrl -OutFile $msi -UseBasicParsing
-                    Say "               Downloaded $([math]::Round((Get-Item $msi).Length / 1MB, 1)) MB" DarkGray
+                    Import-Module BitsTransfer -ErrorAction Stop
+                    Say "               Using BITS transfer..." DarkGray
+                    Start-BitsTransfer -Source $msiUrl -Destination $msi -Priority Foreground -ErrorAction Stop
+                    if (Test-Path $msi) { $dlOk = $true }
+                } catch {
+                    Say "               BITS failed: $($_.Exception.Message)" DarkGray
+                }
+
+                # Method 2: curl.exe with HTTP/2 and parallel connections
+                if (-not $dlOk -and (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
+                    Say "               Using curl.exe..." DarkGray
+                    & curl.exe -L --http2 --tcp-fastopen --compressed --parallel-max 4 -o $msi $msiUrl 2>&1 | Out-Null
+                    if ((Test-Path $msi) -and (Get-Item $msi).Length -gt 50MB) { $dlOk = $true }
+                }
+
+                # Method 3: last-resort Invoke-WebRequest
+                if (-not $dlOk) {
+                    Say "               Falling back to Invoke-WebRequest..." DarkGray
+                    try {
+                        Invoke-WebRequest -Uri $msiUrl -OutFile $msi -UseBasicParsing
+                        $dlOk = $true
+                    } catch {
+                        Say "               Download failed: $($_.Exception.Message)" Red
+                    }
+                }
+
+                if ($dlOk) {
+                    $elapsed = (Get-Date) - $sw
+                    $secs    = "{0:N1}" -f $elapsed.TotalSeconds
+                    $bytes   = (Get-Item $msi).Length
+                    $mb      = "{0:N1}" -f ($bytes / 1MB)
+                    $rate    = if ($elapsed.TotalSeconds -gt 0) { "{0:N1}" -f ($bytes / 1MB / $elapsed.TotalSeconds) } else { "?" }
+                    Say "               Downloaded $mb MB in ${secs}s ($rate MB/s)" Green
                     Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
                     Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart REBOOT=ReallySuppress" -Wait -Verb RunAs
                     Say "               Install triggered (UAC prompt required)." DarkGray
-                } catch {
-                    Say "               Download failed: $($_.Exception.Message)" Red
                 }
             } else {
                 $gu = "${env:ProgramFiles(x86)}\Google\Update\GoogleUpdate.exe"
@@ -179,20 +239,30 @@ for ($i = 0; $i -lt $Names.Count; $i++) {
         }
         default {
             if ($hasWinget) {
-                $t = $Target[$i]
+                $t  = $Target[$i]
+                $id = $Winget[$i]
+
+                # Branch-aware winget id for PHP (PHP.PHP.8.2 / .8.3 / .8.4 / .8.5)
+                if ($Names[$i] -eq 'PHP' -and $t) {
+                    $branch = ($t -split '\.')[0..1] -join '.'
+                    $id = "PHP.PHP.$branch"
+                }
+                # Branch-aware winget id for Node (OpenJS.NodeJS = Current, OpenJS.NodeJS.LTS = latest LTS)
+                if ($Names[$i] -eq 'Node.js' -and $t) {
+                    $major = [int](($t -split '\.')[0])
+                    # 22, 24 = even LTS lines; 26 is incoming LTS
+                    if ($major -in 22,24,26) { $id = 'OpenJS.NodeJS.LTS' } else { $id = 'OpenJS.NodeJS' }
+                }
+
                 if ($t) {
-                    Say "               Target: $t (pinned)" DarkGray
-                    winget install --id $Winget[$i] --version $t --silent --accept-source-agreements --accept-package-agreements --force 2>&1 | Out-Null
-                    if ($LASTEXITCODE -ne 0 -and $Names[$i] -eq 'PHP') {
-                        Say "               PHP $t unavailable - trying fallback $PhpFallback (PHP 8.4 branch)." DarkGray
-                        winget install --id 'PHP.PHP.8.4' --version $PhpFallback --silent --accept-source-agreements --accept-package-agreements --force 2>&1 | Out-Null
-                    }
+                    Say "               Target: $t (pinned, winget id: $id)" DarkGray
+                    winget install --id $id --version $t --silent --accept-source-agreements --accept-package-agreements --force 2>&1 | Out-Null
                     if ($LASTEXITCODE -ne 0) {
-                        Say "               Pinned $t unavailable - falling back to latest in winget." DarkGray
-                        winget upgrade --id $Winget[$i] --silent --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
+                        Say "               Pinned $t unavailable in winget - falling back to latest in branch." DarkGray
+                        winget upgrade --id $id --silent --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
                     }
                 } else {
-                    winget upgrade --id $Winget[$i] --silent --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
+                    winget upgrade --id $id --silent --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
                 }
             } else {
                 Say "               No updater available (winget missing)." Red
