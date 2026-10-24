@@ -36,7 +36,9 @@
 #                                 without Pro): emSign ECC Root CA - G3 distrusted directly
 #   distro Firefox package ...... package update; where the distro has none: Mozilla's build swapped in
 #   end-of-life lines ........... moved to the nearest supported line (Node.js, PHP)
-# Every change is backed up first (/var/backups/vulnpatch). After patching the whole machine
+# Each change is backed up while it is made (/var/backups/vulnpatch); once the re-scan confirms an
+# item PATCHED its backup is deleted, so no old versions are left behind (--keep-backups keeps
+# them; backups stay only for items that are not confirmed). After patching the whole machine
 # is scanned again and every copy is reported PATCHED / STILL VULNERABLE (with the reason).
 #
 #   sudo bash vulnpatch-linux.sh --scan     # detection report only (+ JSON)
@@ -45,6 +47,7 @@
 # Options:
 #   --pick SPEC     (--apply) choose without the prompt: all | 1,3,5-7 | php,node | none
 #   --only LIST     php,node,python,java,chrome,chromium,edge,brave,firefox,ca (limits the plan)
+#   --keep-backups  keep the backups of verified fixes too (default: deleted once the fix is verified)
 #   --report PATH   folder (or .csv file) for the report, e.g. a mounted share
 #                   (default: your Desktop, else Downloads - file vulnpatch-report-<host>.csv)
 #   --no-rebuild    skip PHP/Python source rebuilds (fast run; Python still gets certifi)
@@ -103,7 +106,7 @@ PRODUCTS=(PHP Node.js Bun Python Java Chrome Edge Firefox Brave LiteLLM Pillow B
 SCRIPT_VERSION=2026.10.24
 
 # ---- options ----------------------------------------------------------------
-MODE=plan; ASSUME_YES=0; NO_REBUILD=0; ONLY_PRODUCTS=""; PICK_SPEC=""; REPORT_PATH=""; ARGS_TXT="$*"
+MODE=plan; ASSUME_YES=0; NO_REBUILD=0; KEEP_BACKUPS=0; ONLY_PRODUCTS=""; PICK_SPEC=""; REPORT_PATH=""; ARGS_TXT="$*"
 QUICK=0; NO_EXEC=0; JSON_OUT=""; CUSTOM_PATHS=""; ROOTS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -118,6 +121,7 @@ while [[ $# -gt 0 ]]; do
     --json)       JSON_OUT=$2; shift 2 ;;
     --paths)      CUSTOM_PATHS=$2; shift 2 ;;
     --report)     REPORT_PATH=$2; shift 2 ;;
+    --keep-backups) KEEP_BACKUPS=1; shift ;;
     -h|--help)    if [[ -f $0 ]]; then awk 'NR==1{next} /^set -uo/{exit} {print}' "$0"; else echo "options: --scan | --apply [--pick SPEC] [--only LIST] [--no-rebuild] [--quick] [--json FILE] [-y]"; fi; exit 0 ;;
     *)            echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
   esac
@@ -128,6 +132,8 @@ if [[ $MODE == apply && $EUID -ne 0 ]]; then echo "--apply needs root (sudo)" >&
 STAMP=$(date +%Y%m%d-%H%M%S)
 LOGDIR=/var/log/vulnpatch
 BACKUP_DIR=/var/backups/vulnpatch
+BACKUP_INDEX=$BACKUP_DIR/index-$STAMP.tsv   # item <TAB> backup, to delete each one once its fix is verified
+CUR_KEY=""; BACKUPS_DROPPED=0
 LOG=/dev/null
 # questions are read from the keyboard even when the script itself arrives on stdin (curl ... | sudo bash)
 TTY_IN=/dev/stdin
@@ -998,8 +1004,11 @@ set_kind() {  # picks the automatic action for one finding (PLAN_KIND / PLAN_DES
         if (( NO_REBUILD )); then PLAN_KIND[$k]=external; PLAN_DESC[$k]="rebuild skipped (--no-rebuild)"
         else PLAN_KIND[$k]=rebuild; PLAN_DESC[$k]="rebuild PHP ${R_FIX[$k]} with the original ./configure options (as $(runas_for "$k"))"; fi ;;
       Python)
-        # any Python with no package of its own (inside apps, tarball, pyenv, uv, conda, temp): rebuilt in place
-        if [[ -n ${R_FIX[$k]} && $st != EOL ]] && ver_lt "${R_VER[$k]}" "${R_FIX[$k]}" && (( ! NO_REBUILD )); then
+        # uv / rye / pdm Pythons are prebuilt python-build-standalone builds: the same project's build of the fix
+        if [[ -n ${R_FIX[$k]} && $st != EOL ]] && ver_lt "${R_VER[$k]}" "${R_FIX[$k]}" && pbs_target "${R_ROOT[$k]}" >/dev/null; then
+          PLAN_KIND[$k]=pbs; PLAN_DESC[$k]="python-build-standalone ${R_FIX[$k]} (the build uv installs) swapped into the same folder, site-packages kept"
+        # any other Python with no package of its own (inside apps, tarball, pyenv, conda, temp): rebuilt in place
+        elif [[ -n ${R_FIX[$k]} && $st != EOL ]] && ver_lt "${R_VER[$k]}" "${R_FIX[$k]}" && (( ! NO_REBUILD )); then
           PLAN_KIND[$k]=rebuild; PLAN_DESC[$k]="${pre}rebuild Python ${R_FIX[$k]} with the original ./configure options (as $(runas_for "$k"))"
         else
           PLAN_KIND[$k]=certifi; PLAN_DESC[$k]="${pre}refresh certifi in place"
@@ -1051,7 +1060,7 @@ short_loc() {  # keeps long paths readable: /usr/share/curso...resources/helpers
 action_label() {
   case ${PLAN_KIND[$1]} in
     rebuild)                    echo "rebuild" ;;
-    node|node-bin|firefox|chromium) echo "replace" ;;
+    node|node-bin|firefox|chromium|pbs) echo "replace" ;;
     certifi|venvs)              echo "certifi" ;;
     java)                       echo "blocklist" ;;
     ca)                         echo "distrust" ;;
@@ -1094,7 +1103,7 @@ print_plan() {
   printf '  %spip / npm update%s = the fixed version installed in that Python environment / project (package.json + lock file backed up)\n' "$DIM" "$RST"
   printf '  %sclean%s = malicious files quarantined, backdoor stopped, clean version installed - credentials must be ROTATED\n' "$DIM" "$RST"
   printf '  %sKEV%s = on the CISA list of actively exploited vulnerabilities - updated to the newest version available\n' "$DIM" "$RST"
-  printf '  %sEvery change is backed up first to %s%s\n' "$DIM" "$BACKUP_DIR" "$RST"
+  printf '  %sOld versions are backed up during the run and deleted once the fix is verified (--keep-backups keeps them)%s\n' "$DIM" "$RST"
   if (( ${#EXTERNAL_ORDER[@]} )); then
     printf '\n  %sUpdated outside this script (%d):%s\n' "$DIM" "${#EXTERNAL_ORDER[@]}" "$RST"
     for k in "${EXTERNAL_ORDER[@]}"; do printf '    %s- %s %s  %s: %s%s\n' "$DIM" "${R_PROD[$k]}" "${R_VER[$k]}" "$(short_loc "${R_ROOT[$k]}")" "${PLAN_DESC[$k]}" "$RST"; done
@@ -1115,14 +1124,6 @@ report_brief() {  # plan/apply mode: counts + what is already fine (full table: 
   n_f=$((n_v + n_e + n_r + n_p))
   printf '  Found %d copies: %s%d vulnerable%s, %s%d end-of-life%s, %s%d review%s, %s%d already patched%s   (full table: --scan)\n' \
     "$n_f" "$RED" "$n_v" "$RST" "$RED" "$n_e" "$RST" "$YEL" "$n_r" "$RST" "$GRN" "$n_p" "$RST"
-  if (( n_p )); then
-    printf '  Already patched - nothing to do:\n'
-    for k in "${KEYS[@]}"; do
-      if [[ ${R_STATUS[$k]} == PATCHED ]]; then
-        printf '    %s-%s %-8s %-24s %s\n' "$GRN" "$RST" "${R_PROD[$k]}" "${R_VER[$k]}" "$(short_loc "${R_ROOT[$k]}")"
-      fi
-    done
-  fi
   nf=$(not_found_list)
   [[ -n $nf ]] && printf '  %sNOT FOUND (not installed): %s%s\n' "$DIM" "$nf" "$RST"
   return 0
@@ -1174,13 +1175,7 @@ choose_items() {  # asks (or takes --pick) which plan items to patch; returns 1 
     if [[ -n ${PICKED[$k]:-} ]]; then i=$((i + 1)); total=$((total + $(est_min "$k"))); fi
   done
   if (( i == 0 )); then echo "  Nothing selected - nothing changed."; return 1; fi
-  printf '\n  Selected %d item(s) - estimated ~%d min:\n' "$i" "$total"
-  for k in "${PICK_ORDER[@]}"; do
-    n=$((n + 1))
-    if [[ -n ${PICKED[$k]:-} ]]; then
-      printf '  %3d  %-8s %-16s -> %-14s %s\n' "$n" "$(disp_prod "${R_PROD[$k]}")" "${R_VER[$k]}" "${R_FIX[$k]:--}" "${PLAN_DESC[$k]}"
-    fi
-  done
+  printf '\n  Selected %d of %d item(s) from the plan above - estimated ~%d min\n' "$i" "${#PICK_ORDER[@]}" "$total"
   if (( ! ASSUME_YES )); then
     read -r -p "  Type YES to start: " answer <"$TTY_IN"
     [[ ${answer,,} == yes ]] || { echo "  Aborted - nothing changed."; return 1; }
@@ -1208,14 +1203,32 @@ fetch_verified() {  # url dest sha256
   echo "$3  $2" | sha256sum -c --status
 }
 
-ok_item()   { OUTCOME[$1]="done: $2"; say "    [ok] ${R_PROD[$1]} ${R_ROOT[$1]}: $2"; }
-fail_item() { OUTCOME[$1]="failed: $2"; warn "${R_PROD[$1]} ${R_ROOT[$1]}: $2"; }
+declare -A ITEM_NO; ITEM_TOTAL=0
+item_line() {  # key colour word reason -> the one line an item gets while patching
+  local k=$1 r=$4
+  if (( ${#r} > 100 )); then r="${r:0:97}..."; fi
+  printf '  [%*s/%d] %s%-6s%s %-8s %-16s -> %-14s %s%s\n' "${#ITEM_TOTAL}" "${ITEM_NO[$k]:-?}" "$ITEM_TOTAL" "$2" "$3" "$RST" \
+    "$(disp_prod "${R_PROD[$k]}")" "${R_VER[$k]}" "${R_FIX[$k]:--}" "$(short_loc "${R_ROOT[$k]}")" "${r:+  - $r}"
+}
+ok_item()   { OUTCOME[$1]="done: $2"; printf '[ok] %s %s: %s\n' "${R_PROD[$1]}" "${R_ROOT[$1]}" "$2" >>"$LOG"; item_line "$1" "$GRN" ok ""; }
+fail_item() { OUTCOME[$1]="failed: $2"; printf '[failed] %s %s: %s\n' "${R_PROD[$1]}" "${R_ROOT[$1]}" "$2" >>"$LOG"; item_line "$1" "$RED" FAILED "$2"; }
 
 archive_tree() {  # folder or file -> path of a tar.gz backup (old binaries stay restorable but not runnable)
   local d=$1 a
   mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"
   a="$BACKUP_DIR/$(tr '/' '_' <<<"${d#/}")-$STAMP.tar.gz"
-  tar -czf "$a" -C "$(dirname "$d")" "$(basename "$d")" 2>>"$LOG" && printf '%s' "$a"
+  tar -czf "$a" -C "$(dirname "$d")" "$(basename "$d")" 2>>"$LOG" && note_backup "$a" && printf '%s' "$a"
+}
+
+note_backup() { printf '%s\t%s\n' "$CUR_KEY" "$1" >> "$BACKUP_INDEX"; }   # a file: survives $(...) subshells
+
+drop_backups() {  # key -> deletes that item's backups once its fix is verified (no old versions are left behind)
+  local k=$1 key f
+  [[ -f $BACKUP_INDEX ]] || return 0
+  while IFS=$'\t' read -r key f; do
+    if [[ $key == "$k" && -n $f && -e $f ]]; then rm -rf -- "$f" && BACKUPS_DROPPED=$((BACKUPS_DROPPED + 1)); fi
+  done < "$BACKUP_INDEX"
+  OUTCOME[$k]=$(sed -E 's/ \((package\.json )?backup: [^)]*\)//g' <<<"${OUTCOME[$k]:-}")
 }
 
 # moves a freshly extracted tree into the exact path of the old one, so every symlink,
@@ -1459,6 +1472,56 @@ patch_php_rebuild() {
   build_into "$k" "php-$t" "https://www.php.net/distributions/php-$t.tar.xz" "$sha" "$root" install "$(runas_for "$k")" "${args[@]}"
 }
 
+certifi_fix_in() {  # key -> refreshes every outdated certifi in that Python; CFX_MSG says what was done
+  local k=$1
+  local -a sps=() dirs=()
+  CFX_MSG=""
+  mapfile -t sps < <(site_packages_of "${R_ROOT[$k]}")
+  if (( ${#sps[@]} )); then mapfile -t dirs < <(certifi_old_dirs "${sps[@]}"); fi
+  if (( ${#dirs[@]} )) && refresh_certifi_dirs "${dirs[@]}" >>"$LOG" 2>&1; then CFX_MSG=$CERTIFI_MSG; fi
+  return 0
+}
+
+pbs_target() {  # python-build-standalone folder (uv: cpython-3.13.11-linux-x86_64-gnu) -> its target triple
+  local n=${1##*/} arch libc
+  [[ $n == cpython-* && $n != *freethreaded* && $n != *debug* ]] || return 1
+  [[ -d $1/lib && -x $1/bin/python3 ]] || return 1
+  case $n in *x86_64*) arch=x86_64 ;; *aarch64*) arch=aarch64 ;; *) return 1 ;; esac
+  case $n in *musl*) libc=musl ;; *) libc=gnu ;; esac
+  echo "$arch-unknown-linux-$libc"
+}
+
+patch_python_pbs() {  # the same project's prebuilt build of the fixed version, swapped into the same folder
+  local k=$1 root=${R_ROOT[$1]} t=${R_FIX[$1]} target meta url sums name sha tmp mm sp
+  target=$(pbs_target "$root") || { fail_item "$k" "not a python-build-standalone folder"; return; }
+  have python3 || { fail_item "$k" "python3 is needed to read the release list"; return; }
+  if [[ ! -s ${PBS_JSON:-} ]]; then   # one GitHub API call per run, shared by every such Python
+    PBS_JSON=$(mktemp /var/tmp/vulnpatch-pbs.XXXXXX)
+    curl -fsSL "https://api.github.com/repos/astral-sh/python-build-standalone/releases?per_page=8" -o "$PBS_JSON" 2>>"$LOG"
+  fi
+  meta=$(python3 -I -c 'import json, sys
+want, tail = "cpython-%s+" % sys.argv[2], "-%s-install_only_stripped.tar.gz" % sys.argv[3]
+for r in json.load(open(sys.argv[1])):
+    a = {x["name"]: x["browser_download_url"] for x in r["assets"]}
+    for n, u in a.items():
+        if n.startswith(want) and n.endswith(tail) and "SHA256SUMS" in a: print(u, a["SHA256SUMS"], n); sys.exit(0)
+sys.exit(1)' "$PBS_JSON" "$t" "$target" 2>>"$LOG") || { fail_item "$k" "no python-build-standalone $t build for $target published yet"; return; }
+  read -r url sums name <<<"$meta"
+  sha=$(curl -fsSL "$sums" 2>>"$LOG" | awk -v n="$name" '$2 == n {print $1}')
+  tmp=$(mktemp -d "$(dirname "$root")/.vulnpatch.XXXXXX") || { fail_item "$k" "no temp dir"; return; }
+  if [[ -n $sha ]] && fetch_verified "$url" "$tmp/$name" "$sha" && tar -xzf "$tmp/$name" -C "$tmp" --no-same-owner && [[ -x $tmp/python/bin/python3 ]]; then
+    mm=$(cut -d. -f1-2 <<<"$t"); sp=lib/python$mm/site-packages
+    if [[ -d $root/$sp ]]; then rm -rf "$tmp/python/$sp" && cp -a "$root/$sp" "$tmp/python/$sp"; fi   # the user's packages stay
+    if swap_in "$k" "$root" "$tmp/python"; then
+      certifi_fix_in "$k"; if [[ -n $CFX_MSG ]]; then OUTCOME[$k]+="; $CFX_MSG"; fi
+      OUTCOME[$k]="done: python-build-standalone $t swapped in, site-packages kept; ${OUTCOME[$k]#done: }"
+    fi
+  else
+    fail_item "$k" "download/verify/unpack of $name failed"
+  fi
+  rm -rf "$tmp"
+}
+
 patch_python_rebuild() {
   local k=$1 root=${R_ROOT[$1]} t=${R_FIX[$1]} mm py sha old=/usr/local a runas
   local -a raw=() args=() as=() sps=() dirs=()
@@ -1474,7 +1537,10 @@ patch_python_rebuild() {
   mapfile -t args < <(retarget_args "$old" "$root" "${raw[@]}")
   sha=$(py_src_sha "$t"); [[ -n $sha ]] || { fail_item "$k" "could not get the python.org SHA-256 for $t"; return; }
   ensure_build_deps python
-  build_into "$k" "Python-$t" "https://www.python.org/ftp/python/$t/Python-$t.tar.xz" "$sha" "$root" altinstall "$runas" "${args[@]}" || return
+  if ! build_into "$k" "Python-$t" "https://www.python.org/ftp/python/$t/Python-$t.tar.xz" "$sha" "$root" altinstall "$runas" "${args[@]}"; then
+    certifi_fix_in "$k"; if [[ -n $CFX_MSG ]]; then OUTCOME[$k]+="; $CFX_MSG (the runtime itself is still the old version)"; fi
+    return
+  fi
   # the new build ships pip/certifi without the eMudhra CAs, but altinstall keeps an existing older pip
   [[ $runas != root ]] && as=(runuser -u "$runas" --)
   "${as[@]}" "$py" -m ensurepip --upgrade --altinstall >>"$LOG" 2>&1 || warn "ensurepip --upgrade failed for $py"
@@ -1488,7 +1554,8 @@ run_as() {  # account dir extra-PATH command... -> runs it as that account in di
   local u=$1 dir=$2 pre=$3 home v; shift 3
   local -a envs=() as=()
   home=$(getent passwd "$u" | cut -d: -f6)
-  envs=("PATH=${pre:+$pre:}/usr/local/bin:/usr/bin:/bin" "HOME=${home:-/tmp}" "USER=$u" "LANG=C.UTF-8")
+  envs=("PATH=${pre:+$pre:}/usr/local/bin:/usr/bin:/bin" "HOME=${home:-/tmp}" "USER=$u" "LANG=C.UTF-8"
+        "COREPACK_ENABLE_DOWNLOAD_PROMPT=0" "COREPACK_ENABLE_STRICT=0" "CI=1")
   for v in http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY PIP_INDEX_URL npm_config_registry; do
     if [[ -n ${!v:-} ]]; then envs+=("$v=${!v}"); fi
   done
@@ -1548,7 +1615,7 @@ stop_litellm_backdoor() {  # kills whatever holds the backdoor's lock file and b
   done
   rm -f /tmp/remote_code_loader.lock
   if ! grep -qE '^[^#]*[[:space:]]www\.litellm\.dev([[:space:]]|$)' /etc/hosts 2>/dev/null; then
-    cp -a /etc/hosts "$BACKUP_DIR/hosts-$STAMP" 2>/dev/null
+    cp -a /etc/hosts "$BACKUP_DIR/hosts-$STAMP" 2>/dev/null && note_backup "$BACKUP_DIR/hosts-$STAMP"
     printf '0.0.0.0 www.litellm.dev litellm.dev   # vulnpatch: litellm 1.107.0 malware server\n' >>/etc/hosts
   fi
   STOP_MSG="backdoor stopped${pids:+ (PID$pids)}, www.litellm.dev blocked in /etc/hosts"
@@ -1577,15 +1644,72 @@ patch_litellm() {  # the malicious release: startup files out, package and cache
   fi
 }
 
-find_npm() {  # account -> an npm that account can run: the system one, its own Node managers, then any scanned Node
-  local u=$1 home c k
+find_npm() {  # account -> the npm of the NEWEST Node.js that account can run (a current Node avoids engine errors)
+  local u=$1 home c v best="" bv="" k
+  local -a cands=(/usr/bin/npm /usr/local/bin/npm)
   home=$(getent passwd "$u" | cut -d: -f6)
-  for c in /usr/bin/npm /usr/local/bin/npm; do if [[ -x $c ]]; then echo "$c"; return 0; fi; done
-  for c in $(ls -d "$home"/.nvm/versions/node/*/bin/npm "$home"/.volta/bin/npm "$home"/.local/share/fnm/node-versions/*/installation/bin/npm 2>/dev/null | sort -rV); do
-    if [[ -x $c ]]; then echo "$c"; return 0; fi
+  mapfile -t -O "${#cands[@]}" cands < <(ls -d "$home"/.nvm/versions/node/*/bin/npm "$home"/.volta/bin/npm \
+                                           "$home"/.local/share/fnm/node-versions/*/installation/bin/npm 2>/dev/null)
+  for k in "${KEYS[@]}"; do
+    if [[ ${R_PROD[$k]} == Node.js && -z ${R_EMBED[$k]:-} && -x ${R_ROOT[$k]}/bin/npm ]]; then cands+=("${R_ROOT[$k]}/bin/npm"); fi
   done
-  for k in "${KEYS[@]}"; do if [[ ${R_PROD[$k]} == Node.js && -x ${R_ROOT[$k]}/bin/npm ]]; then echo "${R_ROOT[$k]}/bin/npm"; return 0; fi; done
-  return 1
+  for c in "${cands[@]}"; do
+    [[ -x $c && -x ${c%/*}/node ]] || continue
+    v=$(run_bin "${c%/*}/node" --version | first_ver)
+    if [[ -n $v ]] && { [[ -z $bv ]] || ver_lt "$bv" "$v"; }; then best=$c; bv=$v; fi
+  done
+  [[ -n $best ]] || return 1
+  echo "$best"
+}
+
+pm_of() {  # project -> PM (npm | pnpm | yarn | bun) and PM_SPEC (name@version from "packageManager", if any)
+  local p=$1
+  PM_SPEC=$(sed -n 's/.*"packageManager"[[:space:]]*:[[:space:]]*"\([a-z]*@[^"+]*\).*/\1/p' "$p/package.json" 2>/dev/null | head -n1)
+  if [[ -n $PM_SPEC ]]; then PM=${PM_SPEC%%@*}
+  elif [[ -f $p/bun.lock || -f $p/bun.lockb ]]; then PM=bun
+  elif [[ -f $p/pnpm-lock.yaml ]]; then PM=pnpm
+  elif [[ -f $p/yarn.lock ]]; then PM=yarn
+  else PM=npm; fi
+  case $PM in npm|pnpm|yarn|bun) ;; *) PM=npm ;; esac
+}
+
+pm_tool() {  # account npm -> PM_CMD: the project's package manager, installed or fetched for this run
+  local u=$1 npm=$2 dir=${2%/*} home c k
+  home=$(getent passwd "$u" | cut -d: -f6)
+  PM_CMD=()
+  case $PM in
+    npm)  PM_CMD=("$npm") ;;
+    bun)  for c in "$home/.bun/bin/bun" /usr/local/bin/bun /usr/bin/bun; do if [[ -x $c ]]; then PM_CMD=("$c"); break; fi; done
+          if (( ! ${#PM_CMD[@]} )); then
+            for k in "${KEYS[@]}"; do if [[ ${R_PROD[$k]} == Bun && -x ${R_PATHS[$k]%%;*} ]]; then PM_CMD=("${R_PATHS[$k]%%;*}"); break; fi; done
+          fi
+          if (( ! ${#PM_CMD[@]} )); then PM_CMD=("$dir/npx" --yes bun); fi ;;
+    pnpm|yarn)
+          if [[ -x $dir/$PM ]]; then PM_CMD=("$dir/$PM")
+          elif c=$(command -v "$PM" 2>/dev/null); then PM_CMD=("$c")
+          elif [[ -n $PM_SPEC && -x $dir/corepack ]]; then PM_CMD=("$dir/corepack" "$PM")     # the exact version the project asks for
+          elif [[ -n $PM_SPEC ]]; then PM_CMD=("$dir/npx" --yes "$PM_SPEC")
+          elif [[ $PM == yarn ]] && grep -q '^__metadata:' "$PROJ_DIR/yarn.lock" 2>/dev/null; then
+            if [[ -x $dir/corepack ]]; then PM_CMD=("$dir/corepack" yarn); fi                 # Yarn 2+ only comes through corepack
+          elif [[ $PM == yarn ]]; then PM_CMD=("$dir/npx" --yes yarn@1)
+          else PM_CMD=("$dir/npx" --yes pnpm@latest); fi ;;
+  esac
+  (( ${#PM_CMD[@]} ))
+}
+
+set_override() {  # project section name range -> writes the override into package.json with node (any workspace format)
+  local js
+  js=$(mktemp /var/tmp/vulnpatch-override.XXXXXX.js)
+  cat >"$js" <<'EOF'
+const fs = require("fs"), [file, section, name, range] = process.argv.slice(2);
+const j = JSON.parse(fs.readFileSync(file, "utf8"));
+let o = j; for (const part of section.split(".")) { o[part] = o[part] || {}; o = o[part]; }
+o[name] = range;
+fs.writeFileSync(file, JSON.stringify(j, null, 2) + "\n");
+EOF
+  chmod 644 "$js"
+  run_as "$1" "$2" "$5" node "$js" "$2/package.json" "$3" "$4" "$6"
+  local rc=$?; rm -f "$js"; return $rc
 }
 
 dep_field() {  # package.json name -> the section that lists it directly (empty: only a sub-dependency)
@@ -1598,42 +1722,36 @@ for f in ("dependencies", "devDependencies", "optionalDependencies"):
 }
 
 patch_npm() {  # next / sharp: the fixed release inside the project, with the project's own package manager
-  local k=$1 proj=${R_ROOT[$1]} name=${R_LIB[$1]} spec range u npm dir pm=npm tool="" bak field now rc
+  local k=$1 proj=${R_ROOT[$1]} name=${R_LIB[$1]} spec range u npm dir bak field now rc
   local -a files=() cmd=()
   spec=$(npm_spec "$k"); range=${spec#*@}; u=$(runas_for "$k")
-  npm=$(find_npm "$u") || { fail_item "$k" "no npm found for $u - run in the project: npm install $spec"; return; }
-  dir=${npm%/*}
-  [[ -f $proj/pnpm-lock.yaml ]] && pm=pnpm
-  [[ -f $proj/yarn.lock ]] && pm=yarn
-  if [[ $pm != npm ]]; then
-    if [[ -x $dir/$pm ]]; then tool=$dir/$pm; else tool=$(command -v "$pm" 2>/dev/null); fi
-    [[ -n $tool ]] || { fail_item "$k" "this project uses $pm, which is not installed - run in the project: $pm add $spec"; return; }
-  fi
-  mapfile -t files < <(cd "$proj" && ls package.json package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml 2>/dev/null)
+  npm=$(find_npm "$u") || { fail_item "$k" "no Node.js/npm found for $u - run in the project: npm install $spec"; return; }
+  dir=${npm%/*}; PROJ_DIR=$proj
+  pm_of "$proj"
+  pm_tool "$u" "$npm" || { fail_item "$k" "this project uses $PM ${PM_SPEC:+($PM_SPEC) }and it could not be started - run in the project: $PM add $spec"; return; }
+  mapfile -t files < <(cd "$proj" && ls package.json package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml bun.lock bun.lockb 2>/dev/null)
   mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"
   bak=$BACKUP_DIR/$(tr '/' '_' <<<"${proj#/}")-npm-$STAMP.tar.gz
   tar -czf "$bak" -C "$proj" "${files[@]}" 2>>"$LOG" || { fail_item "$k" "could not back up package.json - nothing changed"; return; }
+  note_backup "$bak"
   field=$(dep_field "$proj/package.json" "$name")
   if [[ -n $field ]]; then              # a direct dependency: update it where it is listed
-    case $pm in
-      npm)  cmd=("$npm" install "$spec" --no-audit --no-fund) ;;
-      *)    cmd=("$tool" add "$spec") ;;
-    esac
-    if [[ $field == devDependencies ]]; then case $pm in yarn) cmd+=(--dev) ;; *) cmd+=(--save-dev) ;; esac; fi
+    if [[ $PM == npm ]]; then cmd=("${PM_CMD[@]}" install "$spec" --no-audit --no-fund); else cmd=("${PM_CMD[@]}" add "$spec"); fi
+    if [[ $field == devDependencies ]]; then case $PM in yarn) cmd+=(--dev) ;; bun) cmd+=(--dev) ;; *) cmd+=(--save-dev) ;; esac; fi
     run_as "$u" "$proj" "$dir" "${cmd[@]}"; rc=$?
   else                                  # pulled in by another package (sharp via next): pin it with an override
-    case $pm in npm) field=overrides.$name ;; yarn) field=resolutions.$name ;; pnpm) field=pnpm.overrides.$name ;; esac
-    run_as "$u" "$proj" "$dir" "$npm" pkg set "$field=$range"; rc=$?
+    case $PM in npm|bun) field=overrides ;; yarn) field=resolutions ;; pnpm) field=pnpm.overrides ;; esac
+    set_override "$u" "$proj" "$field" "$name" "$dir" "$range"; rc=$?
     if (( rc == 0 )); then
-      if [[ $pm == npm ]]; then run_as "$u" "$proj" "$dir" "$npm" install --no-audit --no-fund; else run_as "$u" "$proj" "$dir" "$tool" install; fi
+      if [[ $PM == npm ]]; then run_as "$u" "$proj" "$dir" "${PM_CMD[@]}" install --no-audit --no-fund; else run_as "$u" "$proj" "$dir" "${PM_CMD[@]}" install; fi
       rc=$?
     fi
   fi
   now=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$proj/node_modules/$name/package.json" 2>/dev/null | head -n1)
   if (( rc == 0 )) && [[ -n $now ]] && ! ver_lt "$now" "${R_FIX[$k]}"; then
-    ok_item "$k" "$pm: $name ${R_VER[$k]} -> $now (package.json backup: $bak)"
+    ok_item "$k" "$PM: $name ${R_VER[$k]} -> $now (package.json backup: $bak)"
   else
-    fail_item "$k" "$pm could not update $name (now ${now:-?}): $(tail -n 2 <<<"$RUN_OUT" | tr '\n' ' ') - backup: $bak"
+    fail_item "$k" "$PM could not update $name (now ${now:-?}): $(grep -v '^[[:space:]]*$' <<<"$RUN_OUT" | tail -n 2 | tr '\n' ' ') - backup: $bak"
   fi
 }
 
@@ -1696,7 +1814,7 @@ patch_ca() {  # after the ca-certificates update: if this release has no fixed p
   if [[ -f $conf ]] && have update-ca-certificates; then         # Debian / Ubuntu: deselect it in ca-certificates.conf
     name=$(cd /usr/share/ca-certificates 2>/dev/null && ls mozilla/*emSign_ECC_Root_CA_-_G3* 2>/dev/null | head -n1)
     if [[ -z $name ]]; then fail_item "$k" "emSign ECC Root CA - G3 is trusted but not from /usr/share/ca-certificates (look in /usr/local/share/ca-certificates)"; return; fi
-    cp -a "$conf" "$BACKUP_DIR/ca-certificates.conf-$STAMP"
+    cp -a "$conf" "$BACKUP_DIR/ca-certificates.conf-$STAMP" && note_backup "$BACKUP_DIR/ca-certificates.conf-$STAMP"
     if grep -qxF "$name" "$conf"; then sed -i "s|^$name\$|!$name|" "$conf"
     elif ! grep -qxF "!$name" "$conf"; then printf '!%s\n' "$name" >>"$conf"; fi
     update-ca-certificates --fresh >>"$LOG" 2>&1 || warn "update-ca-certificates reported errors (see $LOG)"
@@ -1719,7 +1837,7 @@ patch_ca() {  # after the ca-certificates update: if this release has no fixed p
 run_packages() {
   (( ${#PKGS[@]} )) || return 0
   local p cand todo=() holds=()
-  step "Package manager ($PKGMGR): ${PKGS[*]}"
+  printf '  [pkg] %s: updating %d installed package(s): %s\n' "$PKGMGR" "${#PKGS[@]}" "${PKGS[*]}"
   if [[ $PKGMGR == apt ]]; then
     apt-get update -qq >>"$LOG" 2>&1 || warn "apt-get update reported errors (see $LOG) - continuing"
     mapfile -t holds < <(apt-mark showhold 2>/dev/null)
@@ -1738,37 +1856,43 @@ run_packages() {
   else
     "$PKGMGR" upgrade -y "${PKGS[@]}" >>"$LOG" 2>&1 || warn "$PKGMGR upgrade reported an error (see $LOG)"
   fi
-  for p in "${!NOTE_PKG[@]}"; do warn "$p: ${NOTE_PKG[$p]}"; done
+  for p in "${!NOTE_PKG[@]}"; do printf '  [pkg] %s: %s\n' "$p" "${NOTE_PKG[$p]}"; done
 }
 
 execute_plan() {
-  local k
+  local k n=0
   collect_selected
+  ITEM_TOTAL=0
+  for k in "${PICK_ORDER[@]}"; do   # items handled one by one get a number; package updates run as one batch
+    [[ -n ${PICKED[$k]:-} ]] || continue
+    case ${PLAN_KIND[$k]} in pkg|snap|flatpak) ;; *) ITEM_TOTAL=$((ITEM_TOTAL + 1)); ITEM_NO[$k]=$ITEM_TOTAL ;; esac
+  done
+  printf '\n'
   run_packages
-  if (( ${#SNAPS[@]} )); then step "snap refresh ${SNAPS[*]}"; snap refresh "${SNAPS[@]}" >>"$LOG" 2>&1 || warn "snap refresh failed (see $LOG)"; fi
-  if (( ${#FLATPAKS[@]} )); then step "flatpak update ${FLATPAKS[*]}"; flatpak update -y --noninteractive "${FLATPAKS[@]}" >>"$LOG" 2>&1 || warn "flatpak update failed"; fi
+  if (( ${#SNAPS[@]} )); then printf '  [pkg] snap refresh %s\n' "${SNAPS[*]}"; snap refresh "${SNAPS[@]}" >>"$LOG" 2>&1 || warn "snap refresh failed (see $LOG)"; fi
+  if (( ${#FLATPAKS[@]} )); then printf '  [pkg] flatpak update %s\n' "${FLATPAKS[*]}"; flatpak update -y --noninteractive "${FLATPAKS[@]}" >>"$LOG" 2>&1 || warn "flatpak update failed"; fi
   for k in "${PICK_ORDER[@]}"; do
     [[ -n ${PICKED[$k]:-} ]] || continue
+    CUR_KEY=$k                          # backups made from here on belong to this item
     case ${PLAN_KIND[$k]} in
-      flatpak-user) step "flatpak (user ${R_OWNER[$k]})"
-                    runuser -u "${R_OWNER[$k]}" -- flatpak update --user -y --noninteractive "${R_PKGS[$k]}" >>"$LOG" 2>&1 \
+      flatpak-user) runuser -u "${R_OWNER[$k]}" -- flatpak update --user -y --noninteractive "${R_PKGS[$k]}" >>"$LOG" 2>&1 \
                       && ok_item "$k" "flatpak updated" || fail_item "$k" "flatpak update failed" ;;
-      node)     step "Node.js ${R_VER[$k]} -> ${R_FIX[$k]}  ${R_ROOT[$k]}"; patch_node_manual "$k" ;;
-      node-bin) step "Node.js ${R_VER[$k]} -> ${R_FIX[$k]}  ${R_ROOT[$k]}"; patch_node_binary "$k" ;;
-      firefox)  step "Firefox ${R_VER[$k]} -> ${R_FIX[$k]}  ${R_ROOT[$k]}"; patch_firefox_manual "$k" ;;
-      chromium) step "${R_PROD[$k]} ${R_VER[$k]} -> $CHROME_FIX  ${R_ROOT[$k]}"; patch_chromium "$k" ;;
-      rebuild)  step "${R_PROD[$k]} ${R_VER[$k]} -> ${R_FIX[$k]}  ${R_ROOT[$k]}"
-                if [[ ${R_PROD[$k]} == PHP ]]; then patch_php_rebuild "$k"; else patch_python_rebuild "$k"; fi ;;
-      certifi)  step "Python ${R_VER[$k]} certifi  ${R_ROOT[$k]}"; patch_certifi "$k" ;;
-      venvs)    step "Python virtualenvs (${#VENV_ROOTS[@]}) certifi"; patch_venvs "$k" ;;
-      java)     step "Java ${R_VER[$k]} eMudhra block list  ${R_ROOT[$k]}"; patch_java "$k" ;;
-      ioc)      step "LiteLLM MALWARE  ${R_ROOT[$k]}"; patch_ioc "$k" ;;
-      litellm)  step "LiteLLM ${R_VER[$k]} (MALICIOUS RELEASE)  ${R_ROOT[$k]}"; patch_litellm "$k" ;;
-      pip)      step "${R_PROD[$k]} ${R_VER[$k]} -> ${R_FIX[$k]}  ${R_ROOT[$k]}"; patch_pip "$k" ;;
-      npm)      step "${R_PROD[$k]} ${R_VER[$k]} -> ${R_FIX[$k]}  ${R_ROOT[$k]}"; patch_npm "$k" ;;
-      bun)      step "Bun ${R_VER[$k]} -> $BUN_FIX  ${R_ROOT[$k]}"; patch_bun "$k" ;;
-      ca)       step "OS trust store  ${R_ROOT[$k]}"; patch_ca "$k" ;;
-      firefox-pkg) step "Firefox ${R_VER[$k]} -> ${R_FIX[$k]}  ${R_ROOT[$k]}"; patch_firefox_pkg "$k" ;;
+      node)     patch_node_manual "$k" ;;
+      node-bin) patch_node_binary "$k" ;;
+      firefox)  patch_firefox_manual "$k" ;;
+      chromium) patch_chromium "$k" ;;
+      rebuild)  if [[ ${R_PROD[$k]} == PHP ]]; then patch_php_rebuild "$k"; else patch_python_rebuild "$k"; fi ;;
+      pbs)      patch_python_pbs "$k" ;;
+      certifi)  patch_certifi "$k" ;;
+      venvs)    patch_venvs "$k" ;;
+      java)     patch_java "$k" ;;
+      ioc)      patch_ioc "$k" ;;
+      litellm)  patch_litellm "$k" ;;
+      pip)      patch_pip "$k" ;;
+      npm)      patch_npm "$k" ;;
+      bun)      patch_bun "$k" ;;
+      ca)       patch_ca "$k" ;;
+      firefox-pkg) patch_firefox_pkg "$k" ;;
     esac
   done
   [[ -n ${CERTIFI_TMP:-} ]] && rm -rf "$CERTIFI_TMP"
@@ -1936,7 +2060,7 @@ verify() {  # compares the re-scan with the copies found before patching (same n
     fi
     printf '  %3s  %s%-16s%s %-8s %-16s -> %-16s %s\n' "$i" "$col" "$res" "$RST" "$(disp_prod "${B_PROD[$k]}")" \
       "${B_VER[$k]}" "$after_ver" "$(short_loc "${B_ROOT[$k]}")"
-    case $res in PATCHED|REMOVED) why="" ;; "NOT SELECTED") why="not selected in this run" ;; esac
+    case $res in PATCHED|REMOVED) why=""; (( KEEP_BACKUPS )) || drop_backups "$k" ;; "NOT SELECTED") why="not selected in this run" ;; esac
     add_report_row "${B_PROD[$k]}" "${B_VER[$k]}" "${B_FIX[$k]}" "$after_ver" "$res" "${B_DESC[$k]}" "$why" \
       "${B_ROOT[$k]}" "${B_METHOD[$k]}" "${OUTCOME[$k]:-}"
   done
@@ -1953,6 +2077,14 @@ verify() {  # compares the re-scan with the copies found before patching (same n
   fi
   nf=$(not_found_list)
   [[ -n $nf ]] && printf '  %sNOT FOUND (not installed): %s%s\n' "$DIM" "$nf" "$RST"
+  local kept=0 f
+  if [[ -f $BACKUP_INDEX ]]; then while IFS=$'\t' read -r _ f; do [[ -e $f ]] && kept=$((kept + 1)); done < "$BACKUP_INDEX"; fi
+  if (( KEEP_BACKUPS )); then printf '  Backups kept (--keep-backups): %d in %s\n' "$kept" "$BACKUP_DIR"
+  else
+    printf '  Backups: %d deleted (fix verified - no old versions left)' "$BACKUPS_DROPPED"
+    if (( kept )); then printf ', %d kept in %s for items that are not confirmed (to restore them)' "$kept" "$BACKUP_DIR"; fi
+    printf '\n'
+  fi
   STILL_BAD=$((n_bad + n_skip))
 }
 
@@ -1961,11 +2093,11 @@ restart_check() {   # processes still running the old (replaced/deleted) binarie
   for p in /proc/[0-9]*; do
     exe=$(readlink "$p/exe" 2>/dev/null) || continue
     [[ $exe == *" (deleted)" ]] || continue
-    case ${exe##*/} in php*|node*|python3*|java|bun|chrome*|msedge*|brave*|firefox*) hits+=("PID ${p#/proc/}  ${exe% (deleted)}") ;; esac
+    case ${exe##*/} in php*|node*|python3*|java|bun|chrome*|msedge*|brave*|firefox*) hits+=("${exe% (deleted)}") ;; esac
   done
-  if (( ${#hits[@]} )); then
-    printf '\n  %sRestart needed - these processes still run the old vulnerable code:%s\n' "$YEL" "$RST"
-    printf '    %s\n' "${hits[@]}"
+  if (( ${#hits[@]} )); then   # one line per program, not one per process
+    printf '\n  %sRestart needed - still running the old code:%s ' "$YEL" "$RST"
+    printf '%s\n' "${hits[@]}" | sort | uniq -c | awk '{n = $1; $1 = ""; sub(/^ /, ""); printf "%s%s (%d)", sep, $0, n; sep = ", "} END {print ""}'
   fi
 }
 
