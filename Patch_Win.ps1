@@ -24,7 +24,13 @@
                                  other copy (inside apps, zip, uv, pyenv, conda) gets python.org's signed
                                  build of the fixed version copied in, site-packages kept; certifi refreshed
       end-of-life lines ........ moved to the nearest supported line (Node.js, PHP)
+      Java (any vendor/copy) ... the 16 eMudhra fingerprints added to its lib\security\blocked.certs
+                                 (CVE-2026-91403 - Oracle's own fix); installed JDKs updated with winget first
       Windows CA store ......... the compromised emSign ECC Root CA - G3 is marked untrusted
+    Every run writes an Excel-ready CSV report to the Desktop (one file per machine, updated on each run):
+    host, IP, MAC, each copy found, version before / fixed in / after, the result, and the error for
+    anything that could not be patched. WSL distros, Docker containers and VMs on the machine are listed
+    as NOT SCANNED: they are separate systems - run the script inside each of them.
     Every change is backed up first (C:\ProgramData\vulnpatch\backups). After patching the whole machine
     is scanned again and every copy is reported PATCHED / STILL VULNERABLE (with the reason).
 
@@ -33,7 +39,9 @@
 .PARAMETER Scan    Detection report only (and JSON).
 .PARAMETER Apply   Detect, ask which numbers to patch, patch, verify. Needs an elevated PowerShell.
 .PARAMETER Pick    With -Apply: choose without the prompt - all | 1,3,5-7 | php,node | none
-.PARAMETER Only    Limit the plan to some products: php,node,python,chrome,chromium,edge,brave,firefox,ca
+.PARAMETER Only    Limit the plan to some products: php,node,python,java,chrome,chromium,edge,brave,firefox,ca
+.PARAMETER Report  Folder (or .csv file) for the report, e.g. \\server\share\vulnpatch. Default: your Desktop (else
+                   Downloads), file vulnpatch-report-<COMPUTERNAME>.csv - a re-run updates that same file.
 .PARAMETER Quick   Search the usual install folders only instead of every fixed drive.
 .PARAMETER Json    Where to write the JSON report.
 .PARAMETER Yes     No prompts (patches every plan item unless -Pick says otherwise).
@@ -58,6 +66,7 @@ param(
     [string[]]$Only,
     [switch]$Quick,
     [string]$Json,
+    [string]$Report,
     [switch]$Yes
 )
 
@@ -79,7 +88,38 @@ $EdgeFix    = '156.0.4314.42'
 $BraveFix   = '1.98.60'
 $FirefoxFix = '158.0.1'           # ESR: 153.5.1 / 115.43.1
 $CertifiFix = '2026.10.19'        # first certifi without the compromised eMudhra CAs
-$Products   = 'PHP', 'Node.js', 'Python', 'Chrome', 'Edge', 'Firefox', 'Brave'   # listed as NOT FOUND when absent
+$JavaFix    = @{ '8' = '8.0.511'; '11' = '11.0.33'; '17' = '17.0.21'; '21' = '21.0.13'; '25' = '25.0.5'; '27' = '27.0.1' }   # Oct-2026 CPU (8 = 8u511)
+# CVE-2026-91403: the 16 eMudhra intermediates OpenJDK/Oracle added to lib\security\blocked.certs
+# (JDK-8395142; checked against openjdk/jdk blocked.certs.pem)
+$EmudhraFps = @(
+    '0164D7CEAE5BB909C272AF151FF44B1177AE9B47D9424B94F1D9558C30934D19', '42C4ACCD12C4F59597925E1A08A7A90102608543809308D50EC427E118BA1493',
+    '432EC25F0D28DE9006D97BF752F17BBB2CD41F669933FCB072D9A1148D0261F3', '45A883F349AEDFD5F3A649B5498FFB121712BA8B448F3F2A91DBC5A766FCDDBE',
+    '4B2460A466F95FD40113BCDCCA2CEB29B3B093921DE45474DA7DF48874C630B1', '579480AEA166290BD3C643589E795FC0D0E54E86505D180F1DFF99EFD3199512',
+    '5F1DED4DD590AF74631290CF073B122A2AAC6A1FA479778A0BD43579BD832699', '62B7F9868263F72F6911FC78CEAF72C1979158B7368BF648683BB2AA39B02E72',
+    '7485B51C0ED192878FA1D2F948FB529AE1842CC5086C4B67F7BE5B2039DE9489', '84112972B8E59D14560AE7E7119654474AAD119990CF3722BFC1E3B91615E1FD',
+    '98B896625C0C230ADEEC3EB2CF6AAD5001ECF9156A68644E82374CE5833BC25B', '9E39DE2881273ACC225A149C72BA3E0F51424963669AB633EE1DC7DF5DB067B4',
+    'A496E23AC0CAB8155FC9B117B97EAE368EFCBB9041AEC8804D5A308D2D01C2D8', 'CB6E15165AC802E9B3F993F16C25D41F4E81C21EBDE71AE1B012AC00BF9C7C3F',
+    'E7568FE6E12331F4FD7DE61DA4C7559D0F8EB192A218D4741A3BA75184333838', 'FD9D5C2DBBD4995AB69B8D50C439D9527B00529199C2FD01B2174EB58F07021F'
+)
+# ---- libraries and supply chain (researched 24-Oct-2026) ----
+$PillowFix     = '13.0.0'        # CVE-2026-112900 (Ghostscript RCE) + 5 more; needs Python 3.11+
+$BrotliFix     = '1.2.1'         # CVE-2026-111497 (Node2Shell) in the Brotli library itself
+$BrotliCffiFix = '1.2.1.0'
+$LiteLLMBad    = '1.107.0', '1.82.7', '1.82.8'   # malicious releases (credential stealer + remote-control backdoor)
+$LiteLLMFix    = '1.83.14'       # first release with the April-2026 CVE fixes (CVSS 10.0 RCE)
+$LiteLLMSpec   = 'litellm>=1.106.2,!=1.107.0'
+$NextFix       = @{ '15' = '15.5.28'; '16' = '16.4.1' }   # 14-Oct-2026: use-cache RCE, image RCE, Server Actions DoS
+$SharpFix      = '0.35.5'        # librsvg RCE through image processing (CVE-2026-96889)
+$BunFix        = '1.4.4'         # CVE-2026-111497 (Node2Shell) in Bun
+$KevDays       = 30              # CISA KEV additions of the last N days are matched against installed apps
+$KevUrl        = 'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json'
+# litellm 1.107.0 indicators (Socket / Aikido): SHA-256 of cook.pth, cook.py, sitecustomize.py (two builds each)
+$LiteLLMIocSha = '7f191632e7320705d154b85204f1ae546b543acbd7e8861229b76f5042b92bdb', '84dc8c82c0a4a4a62552ef826b49fcc86d1a5c4a5d0f2c06665723f93d129d7d',
+                 '9dd0a3926f96a37eb86cf1ee2310d9be93139cc4ebef3ef9e2efe9531390be25', '03ac2a8b752605d1d7710979c17ff18b03dd978203ba23ba97fd8ce3d6f897ea',
+                 '34bef04fe88ac9d0aae0475630b1738681d15b94f233ac8aa46eacf5968305fa', 'b6122440d0d9cb1eb1ade9933f49214da8c31288de7710c076c2680dfa528465'
+$LiteLLMIocMark = 'remote_code_loader|letters9813|litellm\.dev/healthcheck|XWiA8gZNa7NcX2XRoAEb'
+$Products   = 'PHP', 'Node.js', 'Bun', 'Python', 'Java', 'Chrome', 'Edge', 'Firefox', 'Brave', 'LiteLLM', 'Pillow', 'Brotli', 'Next.js', 'sharp'   # listed as NOT FOUND when absent
+$ScriptVersion = '2026.10.24'
 
 $Mode = 'plan'
 if ($Scan)  { $Mode = 'scan' }
@@ -288,8 +328,16 @@ public static class VpWalk {
         while (todo.Count > 0) {
             string dir = todo.Pop();
             try {
-                foreach (string f in Directory.EnumerateFiles(dir, "*.exe"))
-                    if (want.Contains(Path.GetFileName(f))) hits.Add(f);
+                string leaf = Path.GetFileName(dir);
+                bool npmPkg = (leaf.Equals("next", StringComparison.OrdinalIgnoreCase) || leaf.Equals("sharp", StringComparison.OrdinalIgnoreCase))
+                              && Path.GetFileName(Path.GetDirectoryName(dir) ?? "").Equals("node_modules", StringComparison.OrdinalIgnoreCase);
+                bool pyDist = leaf.EndsWith(".dist-info", StringComparison.OrdinalIgnoreCase) && LibDist(leaf);
+                foreach (string f in Directory.EnumerateFiles(dir)) {
+                    string n = Path.GetFileName(f);
+                    if (want.Contains(n)) hits.Add(f);
+                    else if (npmPkg && n.Equals("package.json", StringComparison.OrdinalIgnoreCase)) hits.Add(f);
+                    else if (pyDist && n.Equals("METADATA", StringComparison.OrdinalIgnoreCase)) hits.Add(f);
+                }
                 foreach (string d in Directory.EnumerateDirectories(dir)) {
                     try { if ((File.GetAttributes(d) & FileAttributes.ReparsePoint) != 0) continue; } catch { continue; }
                     bool skipIt = false;
@@ -300,12 +348,17 @@ public static class VpWalk {
         }
         return hits;
     }
+    static bool LibDist(string leaf) {   // pillow-*, brotli-*, brotlicffi-*, litellm-* .dist-info
+        string l = leaf.ToLowerInvariant();
+        return l.StartsWith("pillow-") || l.StartsWith("brotli-") || l.StartsWith("brotlicffi-") || l.StartsWith("litellm-");
+    }
 }
 '@
-$ExeNames  = 'php.exe', 'node.exe', 'python.exe', 'chrome.exe', 'msedge.exe', 'firefox.exe', 'brave.exe'
+$ExeNames  = 'php.exe', 'node.exe', 'python.exe', 'java.exe', 'chrome.exe', 'msedge.exe', 'firefox.exe', 'brave.exe', 'bun.exe', 'cook.pth'
 $SkipParts = '\windows\winsxs', '\windows\servicing', '\windows\softwaredistribution', '\windows\installer', '\windows\assembly',
              '\windows\system32\driverstore', '\$recycle.bin', '\system volume information', '\windowsapps',
-             '\edgewebview', '\edgecore', '\edgeupdate', '\programdata\vulnpatch', '\.vulnpatch-'
+             '\edgewebview', '\edgecore', '\edgeupdate', '\programdata\vulnpatch', '\.vulnpatch-',
+             '\oracle\java\javapath'   # Oracle's java.exe launcher copies (they start the real JRE elsewhere)
 
 function Get-SearchRoots {
     if ($Quick) {
@@ -341,11 +394,14 @@ function Find-ProgramFiles {
     foreach ($r in $script:Roots) {
         if ($fast) {
             $hits += @([VpWalk]::Find($r, [string[]]$ExeNames, [string[]]$SkipParts))
-        } else {       # Constrained Language Mode: Windows' own dir /s
-            $out = & $CmdExe /c "dir /s /b /a-d `"$(Join-Path $r '*.exe')`" 2>nul"
+        } else {       # Constrained Language Mode: Windows' own dir /s, one walk for all four kinds of file
+            $out = & $CmdExe /c "dir /s /b /a-d `"$(Join-Path $r '*.exe')`" `"$(Join-Path $r 'package.json')`" `"$(Join-Path $r 'METADATA')`" `"$(Join-Path $r 'cook.pth')`" 2>nul"
             foreach ($p in @($out)) {
                 if (-not $p) { continue }
-                if ($ExeNames -notcontains (Split-Path $p -Leaf).ToLower()) { continue }
+                $leaf = (Split-Path $p -Leaf).ToLower()
+                if ($leaf -eq 'package.json') { if ($p -notmatch '\\node_modules\\(next|sharp)\\package\.json$') { continue } }
+                elseif ($leaf -eq 'metadata') { if ($p -notmatch '\\(pillow|brotli|brotlicffi|litellm)-[^\\]+\.dist-info\\METADATA$') { continue } }
+                elseif ($ExeNames -notcontains $leaf) { continue }
                 if (-not (Test-Skipped $p) -and -not (Test-UnderReparse $p)) { $hits += $p }
             }
         }
@@ -364,7 +420,7 @@ function Get-UninstallEntries {
         foreach ($e in @(Get-ItemProperty $k.Path -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName })) {
             $loc = "$($e.InstallLocation)".Trim().Trim('"').TrimEnd('\')
             $icon = @("$($e.DisplayIcon)" -split ',')[0].Trim('"')
-            $list += @{ Name = "$($e.DisplayName)"; Version = "$($e.DisplayVersion)"; Location = $loc; Icon = $icon; Scope = $k.Hive }
+            $list += @{ Name = "$($e.DisplayName)"; Version = "$($e.DisplayVersion)"; Location = $loc; Icon = $icon; Scope = $k.Hive; Publisher = "$($e.Publisher)" }
         }
     }
     return $list
@@ -387,6 +443,7 @@ function Find-Uninstall([string]$Product, [string]$Root) {   # the product's own
     switch ($Product) {
         'Chrome' { $pat = '^Google Chrome' }  'Edge' { $pat = '^Microsoft Edge$' }  'Firefox' { $pat = '^Mozilla Firefox' }
         'Brave'  { $pat = '^Brave' }          'Node.js' { $pat = '^Node\.js$' }
+        'Java'   { $pat = 'Java|JDK|JRE|OpenJDK|Temurin|Corretto|Zulu|Liberica|Semeru|SapMachine' }
     }
     if (-not $pat) { return $null }
     $r = $Root.TrimEnd('\').ToLower()
@@ -436,6 +493,10 @@ function Get-MethodOf([string]$Product, [string]$Root, $Entry, $PyReg) {
     }
     if ($Product -eq 'Python' -and $PyReg.ContainsKey($r)) { if ($PyReg[$r] -eq 'user') { return 'installer-user' }; return 'installer' }
     if ($Product -eq 'Node.js' -and -not (Test-Path -LiteralPath (Join-Path $Root 'node_modules\npm'))) { return 'bundled-in-app' }
+    if ($Product -eq 'Java') {
+        if ($r -match '\\\.jdks\\|\\\.sdkman\\|\\\.jabba\\') { return 'jdk-manager' }
+        if ($r -match '\\(jre|jbr|runtime|jdk)[^\\]*$' -and (Find-OwningApp $Root)) { return 'bundled-in-app' }   # e.g. Burp, IntelliJ, DBeaver
+    }
     if ($Product -in 'Python', 'Node.js') {
         if ($r -match '\\resources\\|\\dependencies\\|\\runtimes?\\') { return 'bundled-in-app' }
         if ($r -match '\\users\\[^\\]+\\\.[^\\]+\\') { return 'bundled-in-app' }
@@ -455,7 +516,8 @@ function New-Row([string]$Product, [string]$Version, [string]$Method, [string]$R
     @{ Key = "$Product|$Root|$Version"; Product = $Product; Version = $Version; Fixed = ''; Status = ''; Method = $Method
        Root = $Root; Exe = $Exe; Owner = (Get-OwnerOf $Root); Note = ''; Embedded = $false; CertifiOld = @()
        Default = ''; Arch = ''; Flavor = ''; Package = ''; AppName = ''; Kind = ''; Desc = ''; Picked = $false
-       Outcome = ''; MatchKey = ''; Target = ''; Venvs = @() }
+       Outcome = ''; MatchKey = ''; Target = ''; Venvs = @(); Vendor = ''; InPlan = $false
+       Lib = ''; Py = ''; PyMode = ''; PyVer = ''; Major = $false; Kev = ''; KevDate = ''; KevAction = '' }
 }
 
 function Add-Row($Row) {
@@ -481,15 +543,49 @@ function Get-PyCertifiOld([string]$Root, [string]$Version) {   # Lib\site-packag
     return $old
 }
 
+function ConvertTo-JavaVer([string]$v) {   # 1.8.0_402-b06 -> 8.0.402 | 21.0.5+11 -> 21.0.5 | 25 -> 25.0.0
+    $v = @($v -split '[+-]')[0]
+    if ($v -match '^1\.(\d+)\.0_(\d+)') { return "$($Matches[1]).0.$($Matches[2])" }
+    if ($v -match '^1\.(\d+)(\.0)?$') { return "$($Matches[1]).0.0" }
+    if ($v -match '^\d+$') { return "$v.0.0" }
+    return ConvertTo-Ver $v
+}
+
+function Get-JavaRelease([string]$Root, [string]$Key) {   # a value from the JDK/JRE 'release' file (every image has one)
+    $f = Join-Path $Root 'release'
+    if (-not (Test-Path -LiteralPath $f)) { return '' }
+    $m = Select-String -LiteralPath $f -Pattern "^$Key=`"?([^`"]*)`"?\s*$" | Select-Object -First 1
+    if ($m) { return $m.Matches[0].Groups[1].Value }
+    return ''
+}
+
+function Get-JavaBlockFile([string]$Root) {   # the block list that JVM reads (JDK 8: jre\lib\security, blacklisted.certs)
+    $sec = Join-Path $Root 'lib\security'
+    if (Test-Path -LiteralPath (Join-Path $Root 'jre\lib\security')) { $sec = Join-Path $Root 'jre\lib\security' }
+    foreach ($n in 'blocked.certs', 'blacklisted.certs') { $f = Join-Path $sec $n; if (Test-Path -LiteralPath $f) { return $f } }
+    return (Join-Path $sec 'blocked.certs')
+}
+
+function Get-JavaFpCount([string]$File) {   # how many of the 16 eMudhra fingerprints that block list holds
+    if (-not (Test-Path -LiteralPath $File)) { return 0 }
+    $have = @(Get-Content -LiteralPath $File | ForEach-Object { "$_".Trim().ToUpper() })
+    return @($EmudhraFps | Where-Object { $have -contains $_ }).Count
+}
+
 function Add-Copy([string]$Exe, $PyReg, $Defaults) {
     $name = (Split-Path $Exe -Leaf).ToLower()
     $prod = switch ($name) {
         'php.exe' { 'PHP' } 'node.exe' { 'Node.js' } 'python.exe' { 'Python' } 'msedge.exe' { 'Edge' }
-        'firefox.exe' { 'Firefox' } 'brave.exe' { 'Brave' }
+        'firefox.exe' { 'Firefox' } 'brave.exe' { 'Brave' } 'java.exe' { 'Java' } 'bun.exe' { 'Bun' }
         'chrome.exe' { if ($Exe -match '\\Google\\Chrome') { 'Chrome' } else { 'Chromium' } }
     }
     if (-not $prod) { return }
     $root = Split-Path $Exe -Parent
+    if ($prod -eq 'Java') {
+        if ((Split-Path $root -Leaf) -eq 'bin') { $root = Split-Path $root -Parent }
+        # JDK 8: jdk\jre\bin\java.exe belongs to the JDK around it
+        if ((Split-Path $root -Leaf) -eq 'jre' -and (Test-Path -LiteralPath (Join-Path (Split-Path $root -Parent) 'bin\java.exe'))) { return }
+    }
     if ($prod -eq 'Python') {
         # venv launcher templates and packaged copies: Lib\venv\scripts\nt, lib\python3.9\venv\scripts\nt (MinGW/MSYS)
         if ($root -match '\\Lib\\(python[\d.]+\\)?(venv|site-packages)\\') { return }
@@ -508,17 +604,25 @@ function Add-Copy([string]$Exe, $PyReg, $Defaults) {
     }
     if ($prod -eq 'Firefox' -and -not (Test-Path -LiteralPath (Join-Path $root 'xul.dll'))) { $script:Skipped++; return }
     $ver = Get-FileVer $Exe
+    if ($prod -eq 'Java') {   # the 'release' file is exact; java.exe of JDK 8 says e.g. 8.0.4020.8 for 8u402
+        $ver = ConvertTo-JavaVer (Get-JavaRelease $root 'JAVA_VERSION')
+        if (-not $ver -and (Get-FileVer $Exe) -match '^(\d+)\.(\d+)\.(\d+)') {
+            $u = [int]$Matches[3]; if ($Matches[1] -eq '8' -and $u -gt 999) { $u = ($u - ($u % 10)) / 10 }
+            $ver = "$($Matches[1]).$($Matches[2]).$u"
+        }
+    }
     if ($prod -eq 'Brave' -and $ver -match '^\d{3,}\.(\d+\.\d+\.\d+)$') { $ver = $Matches[1] }   # 155.1.97.59 -> 1.97.59
     if (-not $ver) { $script:Skipped++; return }
     if ($prod -eq 'Python' -and $ver -notmatch '^[23]\.') { $script:Skipped++; return }   # e.g. the Python install manager's launcher
     $entry = Find-Uninstall $prod $root
     $row = New-Row $prod $ver (Get-MethodOf $prod $root $entry $PyReg) $root $Exe
     if ($entry) { $row.Package = $entry.Name }
+    if ($prod -eq 'Java') { $row.Vendor = Get-JavaRelease $root 'IMPLEMENTOR' }
     if ($row.Method -eq 'bundled-in-app') {
         $row.Embedded = $true
         $app = Find-OwningApp $root; if ($app) { $row.AppName = $app.Name }
     }
-    if ($prod -in 'PHP', 'Node.js', 'Python') { $row.Arch = Get-PeArch $Exe }
+    if ($prod -in 'PHP', 'Node.js', 'Python', 'Bun') { $row.Arch = Get-PeArch $Exe }
     if ($prod -eq 'PHP') { if (Test-Path -LiteralPath (Join-Path $root 'php8ts.dll')) { $row.Flavor = 'ts' } else { $row.Flavor = 'nts' } }
     if ($prod -eq 'Python') { $row.CertifiOld = @(Get-PyCertifiOld $root $ver) }
     if ($Defaults.ContainsKey($Exe.ToLower())) { $row.Default = $Defaults[$Exe.ToLower()] }
@@ -560,6 +664,152 @@ function Add-VenvRow {   # one row for all Python virtual environments (their ce
     Add-Row $row
 }
 
+# ---- libraries inside Python environments and Node.js projects ------------
+function Get-Norm([string]$s) { return ("$s".ToLower() -replace '[^a-z0-9]', '') }
+
+function Get-PyEnvOf([string]$Sp) {   # site-packages -> @{ Py; Mode (env | user); Ver (3.X) }
+    $e = @{ Py = ''; Mode = 'env'; Ver = '' }
+    if ($Sp -match '\\AppData\\Roaming\\Python\\Python(\d)(\d+)\\site-packages$') { $e.Mode = 'user'; $e.Ver = "$($Matches[1]).$($Matches[2])"; return $e }
+    $pre = $Sp
+    if ($Sp -match '^(.*)\\Lib\\site-packages$') { $pre = $Matches[1] }
+    elseif ($Sp -match '^(.*)\\lib\\python(\d+\.\d+)\\site-packages$') { $pre = $Matches[1]; $e.Ver = $Matches[2] }   # MinGW / MSYS layout
+    foreach ($c in (Join-Path $pre 'python.exe'), (Join-Path $pre 'Scripts\python.exe'), (Join-Path $pre 'bin\python.exe')) {
+        if (Test-Path -LiteralPath $c) { $e.Py = $c; break }
+    }
+    $cfg = Join-Path $pre 'pyvenv.cfg'
+    if (Test-Path -LiteralPath $cfg) {
+        $m = Select-String -LiteralPath $cfg -Pattern '^version(_info)?\s*=\s*(\d+\.\d+)' | Select-Object -First 1
+        if ($m) { $e.Ver = $m.Matches[0].Groups[2].Value }
+    }
+    if (-not $e.Ver -and $e.Py) { $v = Get-FileVer $e.Py; if ($v) { $e.Ver = Get-Branch $v 2 } }
+    return $e
+}
+
+function Add-PyDist([string]$Meta) {   # <site-packages>\<name>-<version>.dist-info\METADATA -> Pillow / Brotli / LiteLLM row
+    $dist = Split-Path $Meta -Parent; $sp = Split-Path $dist -Parent
+    if ($sp -match '\\uv\\cache\\|\\pip\\cache\\|\\archive-v\d+\\') { return }   # download caches, not Python environments
+    $name = ((Split-Path $dist -Leaf) -replace '-.*$', '').ToLower()
+    $prod = switch ($name) { 'pillow' { 'Pillow' } 'brotli' { 'Brotli' } 'brotlicffi' { 'Brotli' } 'litellm' { 'LiteLLM' } }
+    if (-not $prod) { return }
+    $m = Select-String -LiteralPath $Meta -Pattern '^Version:\s*(\S+)' | Select-Object -First 1
+    if (-not $m) { $script:Skipped++; return }
+    $pe = Get-PyEnvOf $sp
+    $row = New-Row $prod $m.Matches[0].Groups[1].Value 'pip' $sp $Meta
+    $row.Key = "$prod|$sp|$name"; $row.Lib = $name; $row.Py = $pe.Py; $row.PyMode = $pe.Mode; $row.PyVer = $pe.Ver
+    Add-Row $row
+}
+
+function Add-NpmCopy([string]$Pj) {   # <project>\node_modules\...\{next,sharp}\package.json -> one row per project (lowest copy)
+    $name = (Split-Path (Split-Path $Pj -Parent) -Leaf).ToLower()
+    $prod = switch ($name) { 'next' { 'Next.js' } 'sharp' { 'sharp' } }
+    if (-not $prod) { return }
+    $m = Select-String -LiteralPath $Pj -Pattern '^\s*"version"\s*:\s*"([^"]+)"' | Select-Object -First 1
+    if (-not $m) { return }
+    $ver = $m.Matches[0].Groups[1].Value
+    if ($ver -notmatch '^\d+\.\d+\.\d+$') { return }                      # canary / pre-releases: not rated
+    $proj = $Pj.Substring(0, $Pj.ToLower().IndexOf('\node_modules\'))
+    if (-not (Test-Path -LiteralPath (Join-Path $proj 'package.json'))) { return }   # global / cache copy without a project
+    $key = "$prod|$proj|"
+    if ($script:RowIndex.ContainsKey($key)) { $o = $script:RowIndex[$key]; if (Test-VerLt $ver $o.Version) { $o.Version = $ver }; return }
+    $row = New-Row $prod $ver 'npm' $proj $Pj
+    $row.Key = $key; $row.Lib = $name
+    Add-Row $row
+}
+
+function Test-LiteLLMIoc([string]$Path) {   # one of the known malicious litellm 1.107.0 files?
+    $h = ''; try { $h = (Get-Hash $Path SHA256).ToLower() } catch { }
+    if ($h -and $LiteLLMIocSha -contains $h) { return $true }
+    $txt = "$(Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue)"
+    if ((Split-Path $Path -Leaf) -eq 'cook.pth' -and $txt.Trim() -eq 'import cook') { return $true }
+    return ($txt -match $LiteLLMIocMark)
+}
+
+function Add-Ioc([string]$F) {   # cook.pth of the litellm 1.107.0 malware (it stays after an uninstall)
+    if (-not (Test-LiteLLMIoc $F)) { return }
+    $sp = Split-Path $F -Parent
+    $row = New-Row 'LiteLLM malware' '1.107.0 hooks' 'ioc' $sp $F
+    $row.Key = "LiteLLM malware|$sp|"
+    Add-Row $row
+}
+
+function Set-LibVerdict($r) {   # libraries, Bun and the malware rows
+    $v = $r.Version; $fix = ''; $st = ''; $note = ''
+    switch ($r.Product) {
+        'Pillow'  { $fix = $PillowFix; $note = 'CVE-2026-112900 (Ghostscript RCE) and 5 more' }
+        'Brotli'  {
+            $fix = $BrotliFix; if ($r.Lib -eq 'brotlicffi') { $fix = $BrotliCffiFix }
+            $note = 'CVE-2026-111497 (Node2Shell) in the Brotli decoder'
+            if (Test-VerLt $v '1.0.3') { $st = 'PATCHED'; $note = 'older than the affected range (1.0.3+)' }
+        }
+        'LiteLLM' {
+            if ($LiteLLMBad -contains $v) { $st = 'COMPROMISED'; $fix = '1.106.2'; $note = 'MALICIOUS RELEASE (credential stealer + backdoor) - rotate every credential used on this machine' }
+            else { $fix = $LiteLLMFix; $note = 'April-2026 CVEs (CVSS 10.0 RCE)' }
+        }
+        'Next.js' {
+            $b = Get-Branch $v 1; $fix = $NextFix[$b]; $note = 'use-cache RCE, image-optimisation RCE, Server Actions DoS (14 Oct 2026)'
+            if (-not $fix) {
+                if ([int]$b -gt 16) { $st = 'PATCHED'; $fix = '-'; $note = 'newer line' }
+                else { $st = 'VULNERABLE'; $fix = $NextFix['15']; $r.Major = $true
+                       $note = "Next.js $b has no fixed release - the project has to move to Next.js $($NextFix['15']) / $($NextFix['16']) (major upgrade)" }
+            }
+        }
+        'sharp'   { $fix = $SharpFix; $note = 'librsvg RCE in image processing (CVE-2026-96889)' }
+        'Bun'     { $fix = $BunFix; $note = 'CVE-2026-111497 (Node2Shell) in Bun''s Brotli decoder' }
+        'LiteLLM malware' { $st = 'COMPROMISED'; $fix = 'removed'; $note = 'litellm 1.107.0 startup hooks (cook.pth / sitecustomize.py) - rotate every credential used on this machine' }
+    }
+    if (-not $st) { if (Test-VerLt $v $fix) { $st = 'VULNERABLE' } else { $st = 'PATCHED'; $note = '' } }
+    $r.Status = $st; $r.Fixed = $fix; $r.Note = $note
+}
+
+# ---- CISA Known Exploited Vulnerabilities: recent additions vs. installed apps (and Windows itself)
+function Test-WingetUpdate([string]$Name) {   # $true = winget offers a newer version | $false = none | $null = cannot tell
+    if (-not $HasWinget) { return $null }
+    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { & winget.exe list --name $Name --exact --upgrade-available --accept-source-agreements --disable-interactivity 2>&1 | Out-Null; $code = $LASTEXITCODE }
+    finally { $ErrorActionPreference = $eap }
+    return ($code -eq 0)
+}
+
+function Add-Kev {
+    $script:KevState = ''
+    try { $kev = @((Get-Json $KevUrl).vulnerabilities) } catch { $script:KevState = 'CISA KEV list could not be downloaded'; return }
+    $since = (Get-Date).AddDays(-$KevDays).ToString('yyyy-MM-dd')
+    $recent = @($kev | Where-Object { "$($_.dateAdded)" -ge $since })
+    # Windows itself: an actively exploited Windows CVE needs the newest cumulative update
+    $win = @($recent | Where-Object { $_.vendorProject -eq 'Microsoft' -and $_.product -eq 'Windows' } | Sort-Object dateAdded)
+    if ($win.Count) {
+        $newest = $win[-1]; $cves = @($win | ForEach-Object { $_.cveID }) -join ', '
+        $hf = @(Get-HotFix -ErrorAction SilentlyContinue | Where-Object { $_.InstalledOn } | Sort-Object InstalledOn)
+        $row = New-Row 'KEV: Microsoft Windows' "$((Get-CimInstance Win32_OperatingSystem).Version)" 'winupdate' 'Windows Update' ''
+        $row.Key = 'KEV: Microsoft Windows|windows|'; $row.Owner = 'system'; $row.Fixed = "update after $($newest.dateAdded)"; $row.Kev = $cves
+        $lastTxt = ''; if ($hf.Count) { $lastTxt = " (newest installed: $($hf[-1].HotFixID) on $($hf[-1].InstalledOn.ToString('yyyy-MM-dd')))" }
+        if ($hf.Count -and $hf[-1].InstalledOn -ge [datetime]"$($newest.dateAdded)") { $row.Status = 'PATCHED'; $row.Note = "CISA KEV (actively exploited): $cves - a Windows update was installed after it was listed$lastTxt" }
+        else { $row.Status = 'VULNERABLE'; $row.Note = "CISA KEV (actively exploited): $cves - no Windows update installed since $($newest.dateAdded)$lastTxt" }
+        Add-Row $row
+    }
+    $skip = 'chrom|firefox|edge|java|node\.?js|php|python|kernel|windows|multiple products|android|ios|macos'
+    foreach ($v in $recent) {
+        if ("$($v.vendorProject) $($v.product)" -match $skip) { continue }
+        $vend = Get-Norm $v.vendorProject; $prod = Get-Norm $v.product; $vend1 = Get-Norm (@("$($v.vendorProject)" -split '\s+')[0])
+        foreach ($e in $script:Entries) {
+            $n = Get-Norm $e.Name
+            $hit = $n.Contains($vend + $prod) -or ($prod.Length -ge 5 -and $n.Contains($prod) -and ($n.Contains($vend1) -or (Get-Norm $e.Publisher).Contains($vend1)))
+            if (-not $hit) { continue }
+            $key = "KEV: $($e.Name)|app|"
+            if ($script:RowIndex.ContainsKey($key)) { if ($script:RowIndex[$key].Kev -notlike "*$($v.cveID)*") { $script:RowIndex[$key].Kev += ", $($v.cveID)" }; continue }
+            $row = New-Row "KEV: $($e.Name)" $e.Version 'winget' "app: $($e.Name)" ''
+            $row.Key = $key; $row.Package = $e.Name; $row.Kev = $v.cveID; $row.KevDate = $v.dateAdded; $row.KevAction = ("$($v.requiredAction)" -replace '\s+', ' ')
+            Add-Row $row
+        }
+    }
+    foreach ($r in @($script:Rows | Where-Object { $_.Method -eq 'winget' })) {   # exposed while winget offers a newer version
+        $r.Fixed = 'latest'; $u = Test-WingetUpdate $r.Package
+        if ($u -eq $true) { $r.Status = 'VULNERABLE'; $r.Note = "CISA KEV (actively exploited, added $($r.KevDate)): $($r.Kev) - winget has a newer version" }
+        elseif ($u -eq $false) { $r.Status = 'PATCHED'; $r.Note = "CISA KEV (actively exploited, added $($r.KevDate)): $($r.Kev) - newest version available through winget is installed; confirm with the vendor advisory: $($r.KevAction)" }
+        else { $r.Status = 'REVIEW'; $r.Note = "CISA KEV (actively exploited, added $($r.KevDate)): $($r.Kev) - no winget to check for a newer version: $($r.KevAction)" }
+    }
+}
+
 # Windows trust store: Microsoft blocks the compromised eMudhra intermediates through its own update channel.
 function Add-CaStore {
     $g3  = @(Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\AuthRoot -ErrorAction SilentlyContinue | Where-Object { $_.Subject -match 'CN=emSign ECC Root CA - G3' })
@@ -583,6 +833,20 @@ function Set-Verdict($r) {
     if ($r.Product -eq 'CA store') { return }
     $v = $r.Version; $st = ''; $fix = ''; $note = ''
     if ($r.Method -eq 'store') { $r.Status = 'REVIEW'; $r.Note = 'Microsoft Store package - Windows Store keeps it updated'; return }
+    if ($r.Product -like 'KEV:*') { return }   # rated by Add-Kev
+    if ($r.Product -in 'Pillow', 'Brotli', 'LiteLLM', 'Next.js', 'sharp', 'Bun', 'LiteLLM malware') { Set-LibVerdict $r; return }
+    if ($r.Product -eq 'Java') {   # rated on the eMudhra block list (CVE-2026-91403); the October CPU version is reported with it
+        $major = Get-Branch $v 1; $fix = $JavaFix[$major]
+        $f = Get-JavaBlockFile $r.Root; $n = Get-JavaFpCount $f
+        if ($n -eq $EmudhraFps.Count) { $r.Status = 'PATCHED'; $note = 'eMudhra certificates blocked (CVE-2026-91403)' }
+        else { $r.Status = 'VULNERABLE'; $note = "CVE-2026-91403: $n of $($EmudhraFps.Count) eMudhra certificates blocked in $(Split-Path $f -Leaf)" }
+        if (-not $fix) { $fix = '-'; $note += "; Java $major is end-of-life (no more updates) - plan a move to Java 21 or 25" }
+        elseif (Test-VerLt $v $fix) { $note += "; older than the October 2026 update ($fix)" }
+        if ($r.Vendor) { $note += "; $($r.Vendor)" }
+        if ($r.Embedded) { $note += "; built into $(if ($r.AppName) { $r.AppName } else { 'another application' })" }
+        $r.Fixed = $fix; $r.Note = $note
+        return
+    }
     if ($r.Method -eq 'venv') {
         $r.Fixed = $CertifiFix
         if ($r.CertifiOld.Count) { $r.Status = 'VULNERABLE'; $r.Note = "$($r.CertifiOld.Count) certifi copies in virtualenvs still trust the compromised eMudhra CAs" }
@@ -643,22 +907,30 @@ function Invoke-Detection {
     $script:Entries = @(Get-UninstallEntries)
     $pyReg = Get-PythonRegistry
     $defaults = Get-DefaultExes
-    foreach ($exe in @(Find-ProgramFiles)) { Add-Copy $exe $pyReg $defaults }
+    foreach ($f in @(Find-ProgramFiles)) {
+        switch ((Split-Path $f -Leaf).ToLower()) {
+            'package.json' { Add-NpmCopy $f }
+            'metadata'     { Add-PyDist $f }
+            'cook.pth'     { Add-Ioc $f }
+            default        { Add-Copy $f $pyReg $defaults }
+        }
+    }
     Add-StorePython
     Add-VenvRow
     Add-CaStore
     foreach ($r in $script:Rows) { Set-Verdict $r }
+    Add-Kev
     Add-Missing
 }
 
 # ---- reports ----------------------------------------------------------------
-function Get-Rank([string]$s) { switch ($s) { 'VULNERABLE' { 0 } 'EOL' { 1 } 'REVIEW' { 2 } 'PATCHED' { 3 } default { 4 } } }
+function Get-Rank([string]$s) { switch ($s) { 'VULNERABLE' { 0 } 'COMPROMISED' { 0 } 'EOL' { 1 } 'REVIEW' { 2 } 'PATCHED' { 3 } default { 4 } } }
 function Get-ProdRank([string]$p) {
-    $order = 'PHP', 'Node.js', 'Python', 'Chrome', 'Chromium', 'Edge', 'Brave', 'Firefox', 'CA store'
+    $order = 'LiteLLM malware', 'PHP', 'Node.js', 'Bun', 'Python', 'Java', 'Chrome', 'Chromium', 'Edge', 'Brave', 'Firefox', 'CA store', 'LiteLLM', 'Pillow', 'Brotli', 'Next.js', 'sharp'
     for ($i = 0; $i -lt $order.Count; $i++) { if ($order[$i] -eq $p) { return $i } }
     return 9
 }
-function Get-StatusColor([string]$s) { switch ($s) { 'VULNERABLE' { 'Red' } 'EOL' { 'Red' } 'REVIEW' { 'Yellow' } 'PATCHED' { 'Green' } default { 'DarkGray' } } }
+function Get-StatusColor([string]$s) { switch ($s) { 'VULNERABLE' { 'Red' } 'COMPROMISED' { 'Red' } 'EOL' { 'Red' } 'REVIEW' { 'Yellow' } 'PATCHED' { 'Green' } default { 'DarkGray' } } }
 
 function Show-Report {
     $sorted = @($script:Rows | Sort-Object @{ e = { Get-Rank $_.Status } }, @{ e = { Get-ProdRank $_.Product } }, @{ e = { $_.Root } })
@@ -667,7 +939,7 @@ function Show-Report {
     foreach ($r in $sorted) {
         $fx = $r.Fixed; if (-not $fx) { $fx = '-' }
         Write-Host ('  {0,-11} ' -f $r.Status) -ForegroundColor (Get-StatusColor $r.Status) -NoNewline
-        Write-Host ('{0,-9} {1,-15} {2,-15} {3}' -f $r.Product, $r.Version, $fx, (Get-ShortLoc $r.Root))
+        Write-Host ('{0,-9} {1,-15} {2,-15} {3}' -f (Get-DispProd $r.Product), $r.Version, $fx, (Get-ShortLoc $r.Root))
     }
     $bad = @($sorted | Where-Object { $_.Status -in 'VULNERABLE', 'EOL', 'REVIEW' })
     if ($bad.Count) {
@@ -683,18 +955,18 @@ function Show-Report {
 
 function Show-Summary {
     $c = @{}
-    foreach ($s in 'VULNERABLE', 'EOL', 'REVIEW', 'PATCHED', 'NOT FOUND') { $c[$s] = @($script:Rows | Where-Object { $_.Status -eq $s }).Count }
-    Write-Host ("`n  Summary: {0} vulnerable, {1} end-of-life, {2} review, {3} patched, {4} not installed" -f $c['VULNERABLE'], $c['EOL'], $c['REVIEW'], $c['PATCHED'], $c['NOT FOUND'])
+    foreach ($s in 'VULNERABLE', 'COMPROMISED', 'EOL', 'REVIEW', 'PATCHED', 'NOT FOUND') { $c[$s] = @($script:Rows | Where-Object { $_.Status -eq $s }).Count }
+    Write-Host ("`n  Summary: {0} vulnerable, {1} end-of-life, {2} review, {3} patched, {4} not installed" -f ($c['VULNERABLE'] + $c['COMPROMISED']), $c['EOL'], $c['REVIEW'], $c['PATCHED'], $c['NOT FOUND'])
     $miss = @($script:Rows | Where-Object { $_.Status -eq 'NOT FOUND' } | ForEach-Object { $_.Product })
     if ($miss.Count) { Write-Host "  NOT FOUND (not installed): $($miss -join ', ')" -ForegroundColor DarkGray }
-    $script:ResultBad = $c['VULNERABLE'] + $c['EOL']
+    $script:ResultBad = $c['VULNERABLE'] + $c['COMPROMISED'] + $c['EOL']
 }
 
 function Show-Brief {
     $found = @($script:Rows | Where-Object { $_.Status -ne 'NOT FOUND' })
     $ok = @($found | Where-Object { $_.Status -eq 'PATCHED' })
     Write-Host ("  Found {0} copies: {1} vulnerable, {2} end-of-life, {3} review, {4} already patched   (full table: -Scan)" -f `
-        $found.Count, @($found | Where-Object { $_.Status -eq 'VULNERABLE' }).Count, @($found | Where-Object { $_.Status -eq 'EOL' }).Count,
+        $found.Count, @($found | Where-Object { $_.Status -in 'VULNERABLE', 'COMPROMISED' }).Count, @($found | Where-Object { $_.Status -eq 'EOL' }).Count,
         @($found | Where-Object { $_.Status -eq 'REVIEW' }).Count, $ok.Count)
     if ($ok.Count) {
         Write-Host '  Already patched - nothing to do:'
@@ -719,7 +991,8 @@ function Write-JsonReport([string]$Path) {
 # =============================================================================
 # PLAN - every finding gets an automatic action
 # =============================================================================
-function Get-ProdToken([string]$p) { switch ($p) { 'Node.js' { 'node' } 'CA store' { 'ca' } default { $p.ToLower() } } }
+function Get-ProdToken([string]$p) { if ($p -like 'KEV:*') { return 'kev' }; switch ($p) { 'Node.js' { 'node' } 'Next.js' { 'next' } 'CA store' { 'ca' } 'LiteLLM malware' { 'litellm' } default { $p.ToLower() } } }
+function Get-DispProd([string]$p) { if ($p -like 'KEV:*') { return 'KEV' }; if ($p -eq 'LiteLLM malware') { return 'MALWARE' }; return $p }   # fits the 8-wide column
 function Test-Selected([string]$p) { (-not $OnlyList.Count) -or ($OnlyList -contains (Get-ProdToken $p)) }
 
 function Get-MatchKey($r) {   # survives a patch: product + location + branch
@@ -727,13 +1000,29 @@ function Get-MatchKey($r) {   # survives a patch: product + location + branch
     if ($r.Product -in 'PHP', 'Python') { $br = Get-Branch $r.Version 2 }
     if ($r.Product -eq 'Node.js') { $br = Get-Branch $r.Version 1 }
     if ($r.Method -eq 'venv') { $br = '' }
+    if ($r.Lib) { $br = $r.Lib }   # libraries: brotli and brotlicffi can share a site-packages
     return "$($r.Product)|$($r.Root)|$br"
 }
 
 function Set-Kind($r) {   # picks the action for one finding
     $m = $r.Method; $p = $r.Product; $kind = ''; $desc = ''
     $appStep = ''; if ($r.Embedded -and $r.AppName -and $HasWinget) { $appStep = "winget upgrade '$($r.AppName)', then " }
-    if ($p -eq 'CA store') { $kind = 'ca'; $desc = 'mark emSign ECC Root CA - G3 as untrusted (certutil)' }
+    if ($p -eq 'LiteLLM malware') { $kind = 'ioc'; $desc = 'quarantine the malicious startup files, stop the backdoor, block its server - then ROTATE credentials' }
+    elseif ($m -eq 'pip') {
+        if ($r.Status -eq 'COMPROMISED') { $kind = 'litellm'; $desc = "remove malicious litellm $($r.Version) and its startup files, install clean litellm - then ROTATE credentials" }
+        else { $kind = 'pip'; $desc = "pip install -U '$(Get-LibSpec $r)' in this Python" }
+    }
+    elseif ($m -eq 'npm') {
+        if ($r.Major) { $kind = 'external'; $desc = $r.Note }
+        else { $kind = 'npm'; $desc = "update to $(Get-NpmSpec $r) in this project (package.json + lock file backed up)" }
+    }
+    elseif ($p -eq 'Bun') { $kind = 'bun'; $desc = "Bun $BunFix swapped in (SHA-256 checked)" }
+    elseif ($m -eq 'winget') {
+        if ($HasWinget) { $kind = 'kev'; $desc = "winget upgrade '$($r.Package)' (CISA KEV)" }
+        else { $kind = 'external'; $desc = "no winget on this PC - update '$($r.Package)' from the vendor: $($r.KevAction)" }
+    }
+    elseif ($m -eq 'winupdate') { $kind = 'winupdate'; $desc = 'start Windows Update (scan, download, install) - restart when Windows asks' }
+    elseif ($p -eq 'CA store') { $kind = 'ca'; $desc = 'mark emSign ECC Root CA - G3 as untrusted (certutil)' }
     elseif ($m -eq 'venv') { $kind = 'venvs'; $desc = "refresh certifi in $($r.Venvs.Count) virtualenvs" }
     elseif ($m -eq 'store') { $kind = 'external'; $desc = 'Microsoft Store package - Windows updates it' }
     elseif ($p -eq 'Python') {
@@ -746,6 +1035,7 @@ function Set-Kind($r) {   # picks the action for one finding
         elseif ($needRt) { $kind = 'certifi'; $desc = "$($appStep)refresh certifi (MinGW/custom build: only its vendor can ship Python $($r.Fixed))" }
         else { $kind = 'certifi'; $desc = "$($appStep)refresh certifi in place" }
     }
+    elseif ($p -eq 'Java') { $kind = 'java'; $desc = "$($appStep)add the eMudhra fingerprints to $(Split-Path (Get-JavaBlockFile $r.Root) -Leaf)" }
     elseif ($p -eq 'Node.js') {
         if ($m -eq 'msi') { $kind = 'installer'; $desc = "Node.js $($r.Fixed) MSI" }
         elseif ($r.Embedded -or -not (Test-Path -LiteralPath (Join-Path $r.Root 'node_modules\npm'))) { $kind = 'node-bin'; $desc = "$($appStep)swap node.exe for $($r.Fixed)" }
@@ -769,7 +1059,7 @@ function Build-Plan {
               Sort-Object @{ e = { Get-ProdRank $_.Product } }, @{ e = { Get-SortVer $_.Version } }, @{ e = { $_.Root } })
     foreach ($r in $cand) {
         Set-Kind $r
-        $r.MatchKey = Get-MatchKey $r
+        $r.MatchKey = Get-MatchKey $r; $r.InPlan = $true
         if ($r.Kind -eq 'external') { $script:External += $r } else { $script:PickOrder += $r }
     }
 }
@@ -778,11 +1068,12 @@ function Get-ActionLabel($r) {
     switch ($r.Kind) {
         'installer' { 'installer' } 'user-installer' { 'installer' } 'replace' { 'replace' } 'node-bin' { 'replace' }
         'chromium' { 'replace' } 'runtime' { 'replace' } 'certifi' { 'certifi' } 'venvs' { 'certifi' } 'pymanager' { 'py update' }
-        'ca' { 'distrust' }
+        'ca' { 'distrust' } 'java' { 'blocklist' } 'pip' { 'pip update' } 'npm' { 'npm update' }
+        'litellm' { 'clean' } 'ioc' { 'clean' } 'bun' { 'replace' } 'kev' { 'update' } 'winupdate' { 'win update' }
         default { '-' }
     }
 }
-function Get-EstMin($r) { switch ($r.Kind) { 'installer' { 2 } 'user-installer' { 2 } 'chromium' { 2 } 'runtime' { 2 } default { 1 } } }
+function Get-EstMin($r) { switch ($r.Kind) { 'installer' { 2 } 'user-installer' { 2 } 'chromium' { 2 } 'runtime' { 2 } 'npm' { 2 } default { 1 } } }
 
 function Show-Plan {
     Write-Host ("`n  {0,3}  {1,-8} {2,-16}    {3,-14} {4,-11} {5,4}  {6}" -f '#', 'PRODUCT', 'INSTALLED', 'FIXED IN', 'ACTION', 'TIME', 'LOCATION')
@@ -790,7 +1081,7 @@ function Show-Plan {
     $i = 0; $total = 0
     foreach ($r in $script:PickOrder) {
         $i++; $m = Get-EstMin $r; $total += $m; $fx = $r.Fixed; if (-not $fx) { $fx = '-' }
-        Write-Host ('  {0,3}  {1,-8} {2,-16} -> {3,-14} {4,-11} {5,3}m  {6}' -f $i, $r.Product, $r.Version, $fx, (Get-ActionLabel $r), $m, (Get-ShortLoc $r.Root))
+        Write-Host ('  {0,3}  {1,-8} {2,-16} -> {3,-14} {4,-11} {5,3}m  {6}' -f $i, (Get-DispProd $r.Product), $r.Version, $fx, (Get-ActionLabel $r), $m, (Get-ShortLoc $r.Root))
     }
     if ($i -eq 0) { Write-Host '       (nothing to patch)' -ForegroundColor DarkGray }
     Write-Host "  $Line"
@@ -799,6 +1090,10 @@ function Show-Plan {
     Write-Host '  replace   = the fixed release swapped into the same folder (runtimes inside apps: app update first)' -ForegroundColor DarkGray
     Write-Host '  certifi   = refresh the certificate bundle inside that Python (removes the compromised eMudhra CAs)' -ForegroundColor DarkGray
     Write-Host '  py update = py install --update   |   distrust = mark the emSign G3 root untrusted in Windows' -ForegroundColor DarkGray
+    Write-Host '  blocklist = add the 16 eMudhra certificates to that Java''s blocked.certs (CVE-2026-91403)' -ForegroundColor DarkGray
+    Write-Host '  pip / npm update = the fixed version installed in that Python environment / project (package.json + lock file backed up)' -ForegroundColor DarkGray
+    Write-Host '  clean     = malicious files quarantined, backdoor stopped, clean version installed - credentials must be ROTATED' -ForegroundColor DarkGray
+    Write-Host '  KEV       = on the CISA list of actively exploited vulnerabilities - updated to the newest version available' -ForegroundColor DarkGray
     Write-Host '  Every change is backed up first to C:\ProgramData\vulnpatch\backups' -ForegroundColor DarkGray
     if ($script:External.Count) {
         Write-Host "`n  Updated outside this script ($($script:External.Count)):" -ForegroundColor DarkGray
@@ -837,7 +1132,7 @@ function Select-Items {   # asks (or takes -Pick) which items to patch; $false =
             Write-Host "`n  Which copies should be patched?"
             Write-Host '    all          every numbered item'
             Write-Host '    1,3,5-7      only those numbers from the list above'
-            Write-Host '    php,node     everything of those products (php node python chrome chromium edge firefox brave ca)'
+            Write-Host '    php,node     everything of those products (php node bun python java chrome chromium edge firefox brave ca litellm pillow brotli next sharp kev)'
             Write-Host '    none         cancel'
             $ans = Read-Host '  Your choice [all]'
             if (Set-Pick $ans) { break }
@@ -850,7 +1145,7 @@ function Select-Items {   # asks (or takes -Pick) which items to patch; $false =
     $i = 0
     foreach ($r in $script:PickOrder) {
         $i++
-        if ($r.Picked) { Write-Host ('  {0,3}  {1,-8} {2,-16} -> {3,-14} {4}' -f $i, $r.Product, $r.Version, $r.Fixed, $r.Desc) }
+        if ($r.Picked) { Write-Host ('  {0,3}  {1,-8} {2,-16} -> {3,-14} {4}' -f $i, (Get-DispProd $r.Product), $r.Version, $r.Fixed, $r.Desc) }
     }
     if (-not $Yes) {
         if ((Read-Host '  Type YES to start') -ne 'YES') { Write-Host '  Aborted - nothing changed.'; return $false }
@@ -1190,6 +1485,213 @@ function Update-PythonInstaller($r) {
     return Add-CertifiStep $r "Python $($r.Fixed) installer upgraded this copy in place (SHA-256 checked)"
 }
 
+# ---- libraries, Bun, the litellm malware, CISA KEV apps, Windows Update ------
+function Get-LibSpec($r) {   # pip requirement of the fixed release
+    switch ($r.Lib) { 'pillow' { "pillow>=$PillowFix" } 'brotli' { "brotli>=$BrotliFix" } 'brotlicffi' { "brotlicffi>=$BrotliCffiFix" } 'litellm' { $LiteLLMSpec } }
+}
+# exact versions: a '^' would be eaten by cmd.exe when npm.cmd runs (npm still saves it as ^x.y.z)
+function Get-NpmSpec($r) { if ($r.Lib -eq 'sharp') { return "sharp@$SharpFix" }; return "next@$($NextFix[(Get-Branch $r.Version 1)])" }
+
+function Get-PyFor($r) {   # the interpreter that owns this site-packages (user site: the installed Python of that version)
+    if ($r.Py -and (Test-Path -LiteralPath $r.Py)) { return $r.Py }
+    if ($r.PyMode -eq 'user') {
+        $c = @($script:Rows | Where-Object { $_.Product -eq 'Python' -and $_.Exe -and (Get-Branch $_.Version 2) -eq $r.PyVer } | Select-Object -First 1)
+        if ($c.Count) { return $c[0].Exe }
+    }
+    return ''
+}
+
+function Invoke-Pip($r, [string[]]$PipArgs) {   # pip of that environment; last lines in $script:PipOut; $true on success
+    $py = Get-PyFor $r
+    if (-not $py) { $script:PipOut = "no Python interpreter found for $($r.Root)"; return $false }
+    $extra = @(); if ($PipArgs[0] -eq 'install' -and $r.PyMode -eq 'user') { $extra += '--user' }
+    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { $out = @(& $py -m pip @PipArgs @extra --no-input --disable-pip-version-check 2>&1); $code = $LASTEXITCODE } finally { $ErrorActionPreference = $eap }
+    $script:PipOut = (@($out | ForEach-Object { "$_" } | Where-Object { $_.Trim() } | Select-Object -Last 2) -join ' ')
+    return ($code -eq 0)
+}
+
+function Update-Pip($r) {   # Pillow / Brotli / LiteLLM: the fixed release inside that exact Python environment
+    $need = ''; if ($r.Lib -eq 'pillow') { $need = '3.11' } elseif ($r.Lib -eq 'litellm') { $need = '3.10' }
+    if ($need -and $r.PyVer -and (Test-VerLt $r.PyVer $need)) { throw "$($r.Product) $($r.Fixed) needs Python $need or newer - this environment runs Python $($r.PyVer) (move it to a newer Python)" }
+    if (-not (Invoke-Pip $r @('--version'))) {   # e.g. uv venvs ship without pip
+        $py = Get-PyFor $r
+        if ($py) { $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; try { & $py -m ensurepip --upgrade 2>&1 | Out-Null } finally { $ErrorActionPreference = $eap } }
+    }
+    $spec = Get-LibSpec $r
+    if (-not (Invoke-Pip $r @('install', '--upgrade', $spec))) { throw "pip failed: $script:PipOut" }
+    return "pip install -U '$spec' (was $($r.Version))"
+}
+
+function Stop-LiteLLMBackdoor($r) {   # python processes of that environment, the backdoor's temp markers, its server in hosts
+    $envRoot = $r.Root; if ($envRoot -match '^(.*)\\Lib\\site-packages$') { $envRoot = $Matches[1] }
+    $killed = @()
+    foreach ($p in @(Get-RunningUnder $envRoot)) { try { Stop-Process -Id $p.Id -Force -ErrorAction Stop; $killed += $p.Id } catch { } }
+    $ran = $false
+    $temps = @(Join-Path $env:SystemRoot 'Temp') + @(Get-ChildItem (Join-Path $env:SystemDrive 'Users') -Directory -ErrorAction SilentlyContinue | ForEach-Object { Join-Path $_.FullName 'AppData\Local\Temp' })
+    foreach ($t in $temps) {
+        if (Test-Path -LiteralPath (Join-Path $t '.pc_once_72129118c59f5636c0bb')) { $ran = $true }
+        $lock = Join-Path $t 'remote_code_loader.lock'; if (Test-Path -LiteralPath $lock) { Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue }
+    }
+    $hosts = Join-Path $Sys32 'drivers\etc\hosts'
+    if (-not (Select-String -LiteralPath $hosts -Pattern '^[^#]*\swww\.litellm\.dev(\s|$)' -Quiet)) {
+        [void](Save-Backup $hosts)
+        Add-Content -LiteralPath $hosts -Value '0.0.0.0 www.litellm.dev litellm.dev   # vulnpatch: litellm 1.107.0 malware server' -Encoding ASCII
+    }
+    $msg = 'backdoor processes stopped'; if ($killed.Count) { $msg += " (PID $($killed -join ', '))" }
+    $msg += ', www.litellm.dev blocked in hosts'
+    if ($ran) { $msg += '; the stealer had already run here (marker file found)' }
+    return $msg
+}
+
+function Move-LiteLLMIoc([string]$Sp) {   # the malicious startup files -> a quarantine zip; returns what was done
+    $found = @(); $cache = Join-Path $Sp '__pycache__'
+    $pth = Join-Path $Sp 'cook.pth'
+    if ((Test-Path -LiteralPath $pth) -and (Test-LiteLLMIoc $pth)) {
+        $found += $pth
+        if (Test-Path -LiteralPath (Join-Path $Sp 'cook.py')) { $found += Join-Path $Sp 'cook.py' }
+        $found += @(Get-ChildItem -LiteralPath $cache -Filter 'cook.*.pyc' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    }
+    $sc = Join-Path $Sp 'sitecustomize.py'
+    if ((Test-Path -LiteralPath $sc) -and (Test-LiteLLMIoc $sc)) {
+        $found += $sc
+        $found += @(Get-ChildItem -LiteralPath $cache -Filter 'sitecustomize.*.pyc' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    }
+    if (-not $found.Count) { return 'no malicious startup files left in site-packages' }
+    $q = Join-Path $BackupDir "quarantine\litellm-malware-$((($Sp -replace '[:\\]+', '_').Trim('_')))-$Stamp"
+    New-Item -ItemType Directory -Force -Path $q | Out-Null
+    foreach ($f in $found) { Move-Item -LiteralPath $f -Destination $q -Force }
+    New-Zip $q "$q.zip"; Remove-Item -LiteralPath $q -Recurse -Force
+    return "$($found.Count) malicious startup file(s) quarantined in $q.zip"
+}
+
+function Update-Ioc($r) {   # startup files left by litellm 1.107.0 (even after the package itself is gone)
+    $stop = Stop-LiteLLMBackdoor $r
+    $q = Move-LiteLLMIoc $r.Root
+    return "$q; $stop - ROTATE every credential used on this machine (cloud, SSH, API keys, tokens)"
+}
+
+function Update-LiteLLM($r) {   # the malicious release: backdoor stopped, startup files out, package and cached wheel out, clean release in
+    $stop = Stop-LiteLLMBackdoor $r
+    $q = Move-LiteLLMIoc $r.Root
+    [void](Invoke-Pip $r @('uninstall', '-y', 'litellm'))
+    foreach ($d in @(Get-ChildItem -LiteralPath $r.Root -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'litellm' -or $_.Name -like 'litellm-*.dist-info' })) {
+        Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue   # whatever the uninstall left behind
+    }
+    [void](Invoke-Pip $r @('cache', 'remove', 'litellm'))
+    if (-not (Invoke-Pip $r @('install', '--upgrade', $LiteLLMSpec))) { throw "malicious litellm removed, clean reinstall failed: $script:PipOut - $q; ROTATE credentials" }
+    return "malicious litellm $($r.Version) removed, clean litellm installed; $q; $stop - ROTATE every credential used on this machine"
+}
+
+function Find-Npm {   # npm.cmd to run: Program Files\nodejs, else a Node.js copy the scan found, else PATH
+    $c = Join-Path $env:ProgramFiles 'nodejs\npm.cmd'; if (Test-Path -LiteralPath $c) { return $c }
+    foreach ($n in @($script:Rows | Where-Object { $_.Product -eq 'Node.js' })) { $c = Join-Path $n.Root 'npm.cmd'; if (Test-Path -LiteralPath $c) { return $c } }
+    $g = Get-Command npm.cmd -ErrorAction SilentlyContinue; if ($g) { return $g.Source }
+    return ''
+}
+
+function Invoke-InDir([string]$Dir, [string]$NodeDir, [string]$Exe, [string[]]$CmdArgs) {   # last lines in $script:CmdOut; $true on success
+    $oldPath = $env:Path; $env:Path = "$NodeDir;$oldPath"
+    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    Push-Location -LiteralPath $Dir
+    try { $out = @(& $Exe @CmdArgs 2>&1); $code = $LASTEXITCODE } finally { Pop-Location; $ErrorActionPreference = $eap; $env:Path = $oldPath }
+    $script:CmdOut = (@($out | ForEach-Object { "$_" } | Where-Object { $_.Trim() } | Select-Object -Last 2) -join ' ')
+    return ($code -eq 0)
+}
+
+function Update-Npm($r) {   # next / sharp: the fixed release inside the project, with the project's own package manager
+    $spec = Get-NpmSpec $r; $ver = $spec.Substring($spec.IndexOf('@') + 1); $proj = $r.Root
+    $npm = Find-Npm; if (-not $npm) { throw "no npm found - run in the project: npm install $spec" }
+    $nodeDir = Split-Path $npm -Parent; $pm = 'npm'; $tool = $npm
+    if (Test-Path -LiteralPath (Join-Path $proj 'pnpm-lock.yaml')) { $pm = 'pnpm' }
+    if (Test-Path -LiteralPath (Join-Path $proj 'yarn.lock')) { $pm = 'yarn' }
+    if ($pm -ne 'npm') {
+        $tool = Join-Path $nodeDir "$pm.cmd"
+        if (-not (Test-Path -LiteralPath $tool)) {
+            $g = Get-Command "$pm.cmd" -ErrorAction SilentlyContinue
+            if ($g) { $tool = $g.Source } else { throw "this project uses $pm, which is not installed - run in the project: $pm add $spec" }
+        }
+    }
+    $bak = Join-Path $BackupDir "$((($proj -replace '[:\\]+', '_').Trim('_')))-npm-$Stamp"
+    New-Item -ItemType Directory -Force -Path $bak | Out-Null
+    foreach ($f in 'package.json', 'package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml') {
+        $p = Join-Path $proj $f; if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination $bak }
+    }
+    $pkg = Get-Content -LiteralPath (Join-Path $proj 'package.json') -Raw | ConvertFrom-Json
+    $field = ''
+    foreach ($s in 'dependencies', 'devDependencies', 'optionalDependencies') {
+        $sec = $pkg.$s; if ($sec -and (@($sec.PSObject.Properties | ForEach-Object { $_.Name }) -contains $r.Lib)) { $field = $s; break }
+    }
+    if ($field) {   # a direct dependency: update it where it is listed
+        if ($pm -eq 'npm') { $a = @('install', $spec, '--no-audit', '--no-fund') } else { $a = @('add', $spec) }
+        if ($field -eq 'devDependencies') { if ($pm -eq 'yarn') { $a += '--dev' } else { $a += '--save-dev' } }
+        $ok = Invoke-InDir $proj $nodeDir $tool $a
+    } else {        # pulled in by another package (sharp via next): pin it with an override
+        $key = "overrides.$($r.Lib)"; if ($pm -eq 'yarn') { $key = "resolutions.$($r.Lib)" } elseif ($pm -eq 'pnpm') { $key = "pnpm.overrides.$($r.Lib)" }
+        $ok = Invoke-InDir $proj $nodeDir $npm @('pkg', 'set', "$key=$ver")
+        if ($ok) { if ($pm -eq 'npm') { $ok = Invoke-InDir $proj $nodeDir $npm @('install', '--no-audit', '--no-fund') } else { $ok = Invoke-InDir $proj $nodeDir $tool @('install') } }
+    }
+    $now = ''
+    $m = Select-String -LiteralPath (Join-Path $proj "node_modules\$($r.Lib)\package.json") -Pattern '^\s*"version"\s*:\s*"([^"]+)"' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($m) { $now = $m.Matches[0].Groups[1].Value }
+    if (-not $ok -or -not $now -or (Test-VerLt $now $r.Fixed)) { throw "$pm could not update $($r.Lib) (now $now): $script:CmdOut - backup: $bak" }
+    return "$($pm): $($r.Lib) $($r.Version) -> $now (package.json backup: $bak)"
+}
+
+function Update-Bun($r) {   # Bun's own release, SHA-256 checked, swapped for bun.exe in place
+    Assert-NotRunning $r.Root
+    $base = "https://github.com/oven-sh/bun/releases/download/bun-v$BunFix"
+    $name = 'bun-windows-x64'; if ($r.Arch -eq 'arm64') { $name = 'bun-windows-aarch64' }
+    $sums = Get-WebText "$base/SHASUMS256.txt"
+    $line = @($sums -split "`n") | Where-Object { $_ -match "\s$name\.zip\s*$" } | Select-Object -First 1
+    if (-not $line) { throw "no SHA-256 published for $name.zip" }
+    $zip = Get-Download "$base/$name.zip" "$name-$BunFix.zip" (@($line.Trim() -split '\s+')[0]) '' ''
+    $tmp = Join-Path $env:TEMP "vulnpatch-bun-$Stamp"; Expand-Zip $zip $tmp
+    try { $bak = Save-Backup $r.Exe; Copy-Item -LiteralPath (Join-Path $tmp "$name\bun.exe") -Destination $r.Exe -Force }
+    finally { Remove-Item -LiteralPath $tmp -Recurse -Force }
+    return "bun $($r.Version) -> $BunFix (SHA-256 checked, backup: $bak)"
+}
+
+function Update-Kev($r) {   # an app on the CISA KEV list: its newest version through winget
+    Write-Host "    winget upgrade '$($r.Package)' ..."
+    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { $out = @(& winget.exe upgrade --name $r.Package --exact --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1) }
+    finally { $ErrorActionPreference = $eap }
+    if (Test-WingetUpdate $r.Package) { throw "winget could not update it: $((@($out | ForEach-Object { "$_" } | Where-Object { $_.Trim() }) | Select-Object -Last 1) -join ' ') - $($r.KevAction)" }
+    return "updated to the newest version through winget (CISA KEV $($r.Kev))"
+}
+
+function Start-WindowsUpdate($r) {   # actively exploited Windows CVE: the newest cumulative update
+    $uso = Join-Path $Sys32 'UsoClient.exe'
+    if (-not (Test-Path -LiteralPath $uso)) { throw 'UsoClient.exe not found - run Windows Update from Settings' }
+    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { foreach ($a in 'StartScan', 'StartDownload', 'StartInstall') { & $uso $a 2>&1 | Out-Null; Start-Sleep -Seconds 3 } } finally { $ErrorActionPreference = $eap }
+    return 'Windows Update started (scan, download and install run in the background) - restart the PC when Windows asks'
+}
+
+function Update-Java($r) {   # the eMudhra block list (CVE-2026-91403) - Oracle's own fix, for every vendor and every copy
+    $pre = ''
+    if ($r.Fixed -ne '-' -and (Invoke-AppUpdate $r)) { $pre = "app updated ($($r.AppName)); " }
+    $f = Get-JavaBlockFile $r.Root
+    $raw = ''; $have = @()
+    if (Test-Path -LiteralPath $f) { $raw = Get-Content -LiteralPath $f -Raw; $have = @($raw -split "`r?`n" | ForEach-Object { $_.Trim().ToUpper() }) }
+    $missing = @($EmudhraFps | Where-Object { $have -notcontains $_ })
+    if (-not $missing.Count) { return "$($pre)eMudhra certificates already blocked" }
+    $bak = ''; $made = $false
+    if (Test-Path -LiteralPath $f) { $bak = Save-Backup $f }
+    else { New-Item -ItemType Directory -Force -Path (Split-Path $f -Parent) | Out-Null; $raw = "Algorithm=SHA-256`n"; $made = $true }
+    if ($raw -and -not $raw.EndsWith("`n")) { $raw += "`n" }   # the list must not run into the last line
+    $raw += ($missing -join "`n") + "`n"
+    Set-Content -LiteralPath $f -Value $raw -NoNewline -Encoding ASCII
+    # no block list at all: write it under both names (JDK 8-15 read blacklisted.certs, newer ones blocked.certs)
+    $other = Join-Path (Split-Path $f -Parent) 'blacklisted.certs'
+    if ($made -and -not (Test-Path -LiteralPath $other)) { Set-Content -LiteralPath $other -Value $raw -NoNewline -Encoding ASCII }
+    $n = Get-JavaFpCount $f
+    if ($n -ne $EmudhraFps.Count) { throw "block list still incomplete ($n/$($EmudhraFps.Count)) in $f" }
+    $b = ''; if ($bak) { $b = " (backup: $bak)" }
+    return "$pre$($missing.Count) eMudhra certificates added to $f$b - running Java apps need a restart"
+}
+
 function Invoke-Patch {
     foreach ($r in @($script:PickOrder | Where-Object { $_.Picked })) {
         Write-Step "$($r.Product) $($r.Version) -> $($r.Fixed)  $($r.Root)"
@@ -1209,6 +1711,14 @@ function Invoke-Patch {
                 'venvs'     { Update-Venvs $r }
                 'pymanager' { Update-PyManager $r }
                 'runtime'   { Update-PyRuntime $r }
+                'java'      { Update-Java $r }
+                'ioc'       { Update-Ioc $r }
+                'litellm'   { Update-LiteLLM $r }
+                'pip'       { Update-Pip $r }
+                'npm'       { Update-Npm $r }
+                'bun'       { Update-Bun $r }
+                'kev'       { Update-Kev $r }
+                'winupdate' { Start-WindowsUpdate $r }
                 'chromium'  { Update-Chromium $r }
                 'ca'        { Set-CaDistrust $r }
             }
@@ -1230,16 +1740,24 @@ function Show-Verify {
         $i++
         $a = $after[$r.MatchKey]
         $ast = 'GONE'; $aver = '-'; if ($a) { $ast = $a.Status; $aver = $a.Version }
+        $err = ''
         if ($ast -eq 'PATCHED' -or $ast -eq 'GONE') { $res = 'PATCHED'; if ($ast -eq 'GONE') { $res = 'REMOVED' }; $col = 'Green'; $ok++ }
-        elseif (-not $r.Picked) { $res = 'NOT SELECTED'; $col = 'Yellow'; $skip++ }
+        elseif (-not $r.Picked) { $res = 'NOT SELECTED'; $col = 'Yellow'; $skip++; $err = 'not selected in this run' }
         else {
             $res = 'STILL VULNERABLE'; $col = 'Red'; $bad++
-            $why = $r.Outcome; if ($a -and $a.Note) { $why = "$why | now: $($a.Note)" }
+            $why = $r.Outcome; if (-not $why) { $why = 'the fix ran but the copy still reports a vulnerable version' }
+            if ($a -and $a.Note) { $why = "$why | now: $($a.Note)" }
             $details += "$i  $($r.Product) $($r.Version) ($($r.Root)): $why"
+            $err = $why
         }
         Write-Host ('  {0,3}  ' -f $i) -NoNewline
         Write-Host ('{0,-16} ' -f $res) -ForegroundColor $col -NoNewline
-        Write-Host ('{0,-8} {1,-16} -> {2,-16} {3}' -f $r.Product, $r.Version, $aver, (Get-ShortLoc $r.Root))
+        Write-Host ('{0,-8} {1,-16} -> {2,-16} {3}' -f (Get-DispProd $r.Product), $r.Version, $aver, (Get-ShortLoc $r.Root))
+        Add-ReportRow $r.Product $r.Version $r.Fixed $aver $res $r.Desc $err $r.Root $r.Method $r.Outcome
+    }
+    foreach ($r in $script:External) {   # copies only their own updater can fix
+        $a = $after[$r.MatchKey]; $aver = $r.Version; if ($a) { $aver = $a.Version }
+        Add-ReportRow $r.Product $r.Version $r.Fixed $aver 'NOT PATCHED' '-' $r.Desc $r.Root $r.Method $r.Note
     }
     Write-Host "  $Line"
     Write-Host ("  Result: {0} patched, {1} still vulnerable, {2} not selected" -f $ok, $bad, $skip)
@@ -1256,6 +1774,123 @@ function Show-RestartNeeded {
         Write-Host "`n  Restart needed - these processes still run the old code:" -ForegroundColor Yellow
         foreach ($h in $hits) { Write-Host "    PID $($h.Id)  $($h.Path)" }
     }
+}
+
+# ---- Excel-ready CSV report -------------------------------------------------
+$script:ReportRows = @()
+
+function Get-HostInfo {   # IP and MAC of the adapter that has the default gateway
+    $nic = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' -ErrorAction SilentlyContinue)
+    $main = @($nic | Where-Object { $_.DefaultIPGateway } | Select-Object -First 1)
+    if (-not $main.Count) { $main = @($nic | Select-Object -First 1) }
+    $script:HostIp = ''; $script:HostMac = ''
+    if ($main.Count) {
+        $script:HostIp = "$(@($main[0].IPAddress | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' })[0])"
+        $script:HostMac = "$($main[0].MACAddress)"
+    }
+    $script:RunAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $a = @(); if ($Scan) { $a += '-Scan' }; if ($Apply) { $a += '-Apply' }; if ($Pick) { $a += "-Pick $Pick" }
+    if ($OnlyList.Count) { $a += "-Only $($OnlyList -join ',')" }; if ($Quick) { $a += '-Quick' }; if ($Yes) { $a += '-Yes' }
+    $script:ArgsTxt = $a -join ' '
+}
+
+function ConvertTo-CsvLine([string[]]$Fields) { return (@($Fields | ForEach-Object { '"' + ("$_" -replace '"', '""') + '"' }) -join ',') }
+
+function Add-ReportRow([string]$Product, [string]$Before, [string]$Fixed, [string]$After, [string]$Result, [string]$Action,
+                       [string]$Err, [string]$Location, [string]$Method, [string]$Note) {
+    if (-not $Fixed) { $Fixed = '-' }
+    $script:ReportRows += ConvertTo-CsvLine @($env:COMPUTERNAME, $script:HostIp, $script:HostMac, $script:OsName,
+        "vulnpatch-windows.ps1 $ScriptVersion $script:ArgsTxt".Trim(), $script:RunAt, $Mode,
+        $Product, $Before, $Fixed, $After, $Result, $Action, $Err, $Location, $Method, $Note)
+}
+
+function Add-CurrentRows([switch]$SkipPlan) {   # one row per copy as found now (scan / plan), or the copies outside the plan
+    foreach ($r in $script:Rows) {
+        if ($SkipPlan -and $r.InPlan) { continue }
+        if (-not $r.Desc -and $r.Status -notin 'PATCHED', 'NOT FOUND') { Set-Kind $r }
+        $res = $r.Status; $after = ''; $act = $r.Desc; if (-not $act) { $act = '-' }
+        if ($SkipPlan) {
+            $after = $r.Version
+            if ($res -eq 'PATCHED') { $res = 'ALREADY PATCHED' } elseif ($res -eq 'NOT FOUND') { $after = '-' } else { $res = 'NOT SELECTED (-Only)' }
+        }
+        Add-ReportRow $r.Product $r.Version $r.Fixed $after $res $act '' $r.Root $r.Method $r.Note
+    }
+}
+
+function Get-ReportDir {   # the Desktop (else Downloads) of the person running the script; -Report overrides
+    if ($Report -and $Report -notlike '*.csv') { return $Report }
+    if ("$env:USERPROFILE" -like '*\systemprofile*') { return (Join-Path $env:PUBLIC 'Desktop') }   # SYSTEM (Intune / SCCM)
+    $sf = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders' -ErrorAction SilentlyContinue
+    $cand = @("$($sf.Desktop)", (Join-Path $env:USERPROFILE 'Desktop'),                        # OneDrive-redirected Desktop first
+              "$($sf.'{374DE290-123F-4565-9164-39C4925E467B}')", (Join-Path $env:USERPROFILE 'Downloads'))
+    foreach ($p in $cand) { if ($p -and (Test-Path -LiteralPath $p)) { return $p } }
+    return (Join-Path $WorkDir 'reports')
+}
+
+# Containers, WSL distros and virtual machines are separate systems: their disks are image files that a
+# scan of this machine cannot look into. They are listed so none is missed - run the script inside each.
+function Get-InnerSystems {
+    $list = @()
+    $wsl = Join-Path $Sys32 'wsl.exe'
+    if (Test-Path -LiteralPath $wsl) {
+        $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; $u8 = $env:WSL_UTF8; $env:WSL_UTF8 = '1'
+        try { $names = @(& $wsl --list --quiet 2>$null) } catch { $names = @() } finally { $ErrorActionPreference = $eap; $env:WSL_UTF8 = $u8 }
+        foreach ($n in $names) {
+            $n = ("$n" -replace "`0", '').Trim()
+            if ($n -notmatch '^[\w.\-]+$') { continue }
+            if ($n -like 'docker-desktop*') { $list += @{ Kind = 'WSL distro'; Name = $n; How = 'Docker Desktop''s own system - keep Docker Desktop updated' } }
+            else { $list += @{ Kind = 'WSL distro'; Name = $n; How = "run Patch_lin.sh inside it (wsl -d $n -u root)" } }
+        }
+    }
+    if (Get-Command docker.exe -ErrorAction SilentlyContinue) {
+        $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        try { $cs = @(& docker.exe ps -a --format '{{.Names}} ({{.Image}}, {{.Status}})' 2>$null) } catch { $cs = @() } finally { $ErrorActionPreference = $eap }
+        foreach ($c in $cs) { if ("$c".Trim()) { $list += @{ Kind = 'Docker container'; Name = "$c".Trim(); How = 'rebuild its image with patched packages (changes inside a container are lost)' } } }
+    }
+    $vbox = Join-Path $env:ProgramFiles 'Oracle\VirtualBox\VBoxManage.exe'
+    if (Test-Path -LiteralPath $vbox) {
+        $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        try { $vms = @(& $vbox list vms 2>$null) } catch { $vms = @() } finally { $ErrorActionPreference = $eap }
+        foreach ($v in $vms) { if ("$v" -match '^"(.+)" \{') { $list += @{ Kind = 'VirtualBox VM'; Name = $Matches[1]; How = 'run the script inside the VM' } } }
+    }
+    $inv = Join-Path $env:APPDATA 'VMware\inventory.vmls'
+    if (Test-Path -LiteralPath $inv) {
+        foreach ($m in @(Select-String -LiteralPath $inv -Pattern '^vmlist\d+\.config = "(.+\.vmx)"')) {
+            $list += @{ Kind = 'VMware VM'; Name = $m.Matches[0].Groups[1].Value; How = 'run the script inside the VM' }
+        }
+    }
+    if ($IsAdmin -and (Get-Command Get-VM -ErrorAction SilentlyContinue)) {
+        try { foreach ($v in @(Get-VM -ErrorAction Stop)) { $list += @{ Kind = 'Hyper-V VM'; Name = "$($v.Name)"; How = 'run the script inside the VM' } } } catch { }
+    }
+    return $list
+}
+
+function Show-InnerSystems {
+    if (-not $script:Inner.Count) { return }
+    Write-Host "`n  NOT SCANNED - separate systems inside this machine ($($script:Inner.Count)):" -ForegroundColor Yellow
+    foreach ($s in $script:Inner) { Write-Host "    - $($s.Kind): $($s.Name)  ->  $($s.How)" -ForegroundColor Yellow }
+}
+
+function Write-CsvReport {   # one report per machine (Desktop): a re-run updates it; rows of other hosts in a shared file are kept
+    try {
+        if ($Report -like '*.csv') { $f = $Report } else { $f = Join-Path (Get-ReportDir) "vulnpatch-report-$env:COMPUTERNAME.csv" }
+        New-Item -ItemType Directory -Force -Path (Split-Path $f -Parent) | Out-Null
+        foreach ($s in $script:Inner) { Add-ReportRow $s.Kind '-' '-' '-' 'NOT SCANNED' $s.How 'separate system - its disk cannot be scanned from this machine' $s.Name '-' '' }
+        $head = ConvertTo-CsvLine @('Host', 'IP address', 'MAC address', 'OS', 'Script', 'Run at', 'Mode', 'Product', 'Version before',
+                                    'Fixed in', 'Version after', 'Result', 'Action', 'Error / reason', 'Location', 'Install method', 'Note')
+        $keep = @(); $state = 'created'
+        if (Test-Path -LiteralPath $f) {
+            $state = 'updated'
+            $keep = @(Get-Content -LiteralPath $f -Encoding UTF8 | Select-Object -Skip 1 | Where-Object { $_ -and -not $_.StartsWith("`"$env:COMPUTERNAME`",") })
+        }
+        $enc = 'UTF8'; if ($PSVersionTable.PSVersion.Major -ge 6) { $enc = 'utf8BOM' }
+        try { Set-Content -LiteralPath $f -Value (@($head) + $keep + @($script:ReportRows)) -Encoding $enc }
+        catch {   # usually: the file is open in Excel
+            $f = $f -replace '\.csv$', "-$Stamp.csv"; $state = 'saved under a new name - the old one is open in another program (Excel?)'
+            Set-Content -LiteralPath $f -Value (@($head) + @($script:ReportRows)) -Encoding $enc
+        }
+        Write-Host "`n  Excel report $state`: $f" -ForegroundColor Cyan
+    } catch { Write-Note "report not written: $($_.Exception.Message)" }
 }
 
 # =============================================================================
@@ -1275,24 +1910,35 @@ function Invoke-Main {
 
     Write-Step 'Detection: every copy on the machine'
     Invoke-Detection
+    $script:OsName = $os; $script:ReportRows = @()
+    Get-HostInfo
+    $script:Inner = @(Get-InnerSystems)
 
     if ($Mode -eq 'scan') {
         Show-Report
+        Show-InnerSystems
         $out = $Json; if (-not $out) { $out = Join-Path $env:TEMP "vulnscan-$env:COMPUTERNAME-$Stamp.json" }
         Write-JsonReport $out
         Write-Host "  JSON report: $out   ($([int]((Get-Date) - $start).TotalSeconds)s)"
+        Add-CurrentRows; Write-CsvReport
         if ($script:ResultBad) { return 1 } else { return 0 }
     }
 
     Show-Brief
+    Show-InnerSystems
     Build-Plan
-    if (($script:PickOrder.Count + $script:External.Count) -eq 0) { Write-Step 'Nothing to patch - every copy found is already patched'; return 0 }
+    if (($script:PickOrder.Count + $script:External.Count) -eq 0) {
+        Write-Step 'Nothing to patch - every copy found is already patched'
+        Add-CurrentRows; Write-CsvReport
+        return 0
+    }
     Write-Step 'Patch plan'
     Show-Plan
 
     if ($Mode -eq 'plan') {
         Write-Host "`n  Nothing was changed. To patch: run it again with -Apply in an elevated PowerShell."
         Write-Host '  It will ask which numbers to patch (e.g. all | 1,3,5-7 | php,node), or pass -Pick to choose up front.'
+        Add-CurrentRows; Write-CsvReport
         return 1
     }
     if (-not $script:PickOrder.Count) { return 1 }
@@ -1302,6 +1948,7 @@ function Invoke-Main {
     Start-Transcript -Path (Join-Path $LogDir "vulnpatch-$Stamp.log") | Out-Null
     try {
         Write-JsonReport (Join-Path $LogDir "before-$Stamp.json")
+        Add-CurrentRows -SkipPlan     # report rows for the copies that needed nothing (taken before the re-scan)
         Write-Step 'Patching'
         Invoke-Patch
         Write-Step 'Verification: scanning the whole machine again'
@@ -1319,6 +1966,7 @@ function Invoke-Main {
         Write-Host "  PowerShell $($PSVersionTable.PSVersion) | language mode $($ExecutionContext.SessionState.LanguageMode) | log: $LogDir\vulnpatch-$Stamp.log"
         $script:StillBad = 1
     } finally {
+        Write-CsvReport
         Stop-Transcript | Out-Null
     }
     if ($script:StillBad) { return 1 } else { return 0 }
