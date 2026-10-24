@@ -31,7 +31,9 @@
     host, IP, MAC, each copy found, version before / fixed in / after, the result, and the error for
     anything that could not be patched. WSL distros, Docker containers and VMs on the machine are listed
     as NOT SCANNED: they are separate systems - run the script inside each of them.
-    Every change is backed up first (C:\ProgramData\vulnpatch\backups). After patching the whole machine
+    Each change is backed up while it is made (C:\ProgramData\vulnpatch\backups); once the re-scan confirms
+    an item PATCHED its backup is deleted, so no old versions are left behind (-KeepBackups keeps them;
+    backups stay only for items that are not confirmed). After patching the whole machine
     is scanned again and every copy is reported PATCHED / STILL VULNERABLE (with the reason).
 
     Works in Constrained Language Mode (AppLocker / WDAC managed laptops).
@@ -44,6 +46,7 @@
                    Downloads), file vulnpatch-report-<COMPUTERNAME>.csv - a re-run updates that same file.
 .PARAMETER Quick   Search the usual install folders only instead of every fixed drive.
 .PARAMETER Json    Where to write the JSON report.
+.PARAMETER KeepBackups  Keep the backups of verified fixes too (default: deleted once the fix is verified).
 .PARAMETER Yes     No prompts (patches every plan item unless -Pick says otherwise).
 
 .EXAMPLE
@@ -67,6 +70,7 @@ param(
     [switch]$Quick,
     [string]$Json,
     [string]$Report,
+    [switch]$KeepBackups,
     [switch]$Yes
 )
 
@@ -517,7 +521,7 @@ function New-Row([string]$Product, [string]$Version, [string]$Method, [string]$R
        Root = $Root; Exe = $Exe; Owner = (Get-OwnerOf $Root); Note = ''; Embedded = $false; CertifiOld = @()
        Default = ''; Arch = ''; Flavor = ''; Package = ''; AppName = ''; Kind = ''; Desc = ''; Picked = $false
        Outcome = ''; MatchKey = ''; Target = ''; Venvs = @(); Vendor = ''; InPlan = $false
-       Lib = ''; Py = ''; PyMode = ''; PyVer = ''; Major = $false; Kev = ''; KevDate = ''; KevAction = '' }
+       Lib = ''; Py = ''; PyMode = ''; PyVer = ''; Major = $false; Kev = ''; KevDate = ''; KevAction = ''; Backups = @() }
 }
 
 function Add-Row($Row) {
@@ -968,10 +972,6 @@ function Show-Brief {
     Write-Host ("  Found {0} copies: {1} vulnerable, {2} end-of-life, {3} review, {4} already patched   (full table: -Scan)" -f `
         $found.Count, @($found | Where-Object { $_.Status -in 'VULNERABLE', 'COMPROMISED' }).Count, @($found | Where-Object { $_.Status -eq 'EOL' }).Count,
         @($found | Where-Object { $_.Status -eq 'REVIEW' }).Count, $ok.Count)
-    if ($ok.Count) {
-        Write-Host '  Already patched - nothing to do:'
-        foreach ($r in $ok) { Write-Host ('    - {0,-8} {1,-24} {2}' -f $r.Product, $r.Version, (Get-ShortLoc $r.Root)) -ForegroundColor Green }
-    }
     $miss = @($script:Rows | Where-Object { $_.Status -eq 'NOT FOUND' } | ForEach-Object { $_.Product })
     if ($miss.Count) { Write-Host "  NOT FOUND (not installed): $($miss -join ', ')" -ForegroundColor DarkGray }
 }
@@ -1094,7 +1094,7 @@ function Show-Plan {
     Write-Host '  pip / npm update = the fixed version installed in that Python environment / project (package.json + lock file backed up)' -ForegroundColor DarkGray
     Write-Host '  clean     = malicious files quarantined, backdoor stopped, clean version installed - credentials must be ROTATED' -ForegroundColor DarkGray
     Write-Host '  KEV       = on the CISA list of actively exploited vulnerabilities - updated to the newest version available' -ForegroundColor DarkGray
-    Write-Host '  Every change is backed up first to C:\ProgramData\vulnpatch\backups' -ForegroundColor DarkGray
+    Write-Host '  Old versions are backed up during the run and deleted once the fix is verified (-KeepBackups keeps them)' -ForegroundColor DarkGray
     if ($script:External.Count) {
         Write-Host "`n  Updated outside this script ($($script:External.Count)):" -ForegroundColor DarkGray
         foreach ($r in $script:External) { Write-Host "    - $($r.Product) $($r.Version)  $(Get-ShortLoc $r.Root): $($r.Desc)" -ForegroundColor DarkGray }
@@ -1141,12 +1141,7 @@ function Select-Items {   # asks (or takes -Pick) which items to patch; $false =
     $chosen = @($script:PickOrder | Where-Object { $_.Picked })
     if (-not $chosen.Count) { Write-Host '  Nothing selected - nothing changed.'; return $false }
     $total = 0; foreach ($r in $chosen) { $total += Get-EstMin $r }
-    Write-Host "`n  Selected $($chosen.Count) item(s) - estimated ~$total min:"
-    $i = 0
-    foreach ($r in $script:PickOrder) {
-        $i++
-        if ($r.Picked) { Write-Host ('  {0,3}  {1,-8} {2,-16} -> {3,-14} {4}' -f $i, (Get-DispProd $r.Product), $r.Version, $r.Fixed, $r.Desc) }
-    }
+    Write-Host "`n  Selected $($chosen.Count) of $($script:PickOrder.Count) item(s) from the plan above - estimated ~$total min"
     if (-not $Yes) {
         if ((Read-Host '  Type YES to start') -ne 'YES') { Write-Host '  Aborted - nothing changed.'; return $false }
     }
@@ -1166,6 +1161,7 @@ function Save-Backup([string]$Path, [string]$Exclude) {   # zip of a folder or a
     $zip = Join-Path $BackupDir ((($Path -replace '[:\\]+', '_').Trim('_')) + "-$Stamp.zip")
     if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
     New-Zip $Path $zip $Exclude
+    if ($script:CurRow) { $script:CurRow.Backups += $zip }   # deleted once this item's fix is verified
     return $zip
 }
 
@@ -1583,38 +1579,94 @@ function Update-LiteLLM($r) {   # the malicious release: backdoor stopped, start
     return "malicious litellm $($r.Version) removed, clean litellm installed; $q; $stop - ROTATE every credential used on this machine"
 }
 
-function Find-Npm {   # npm.cmd to run: Program Files\nodejs, else a Node.js copy the scan found, else PATH
-    $c = Join-Path $env:ProgramFiles 'nodejs\npm.cmd'; if (Test-Path -LiteralPath $c) { return $c }
-    foreach ($n in @($script:Rows | Where-Object { $_.Product -eq 'Node.js' })) { $c = Join-Path $n.Root 'npm.cmd'; if (Test-Path -LiteralPath $c) { return $c } }
-    $g = Get-Command npm.cmd -ErrorAction SilentlyContinue; if ($g) { return $g.Source }
-    return ''
+function Find-Npm {   # npm.cmd of the NEWEST Node.js on the machine (a current Node avoids engine errors)
+    $cand = @(Join-Path $env:ProgramFiles 'nodejs\npm.cmd')
+    $cand += @($script:Rows | Where-Object { $_.Product -eq 'Node.js' -and -not $_.Embedded } | ForEach-Object { Join-Path $_.Root 'npm.cmd' })
+    $g = Get-Command npm.cmd -ErrorAction SilentlyContinue; if ($g) { $cand += $g.Source }
+    $best = ''; $bv = ''
+    foreach ($c in $cand) {
+        $node = Join-Path (Split-Path $c -Parent) 'node.exe'
+        if (-not (Test-Path -LiteralPath $c) -or -not (Test-Path -LiteralPath $node)) { continue }
+        $v = Get-FileVer $node   # version resource - nothing is run
+        if ($v -and (-not $bv -or (Test-VerLt $bv $v))) { $best = $c; $bv = $v }
+    }
+    return $best
+}
+
+function Get-ProjectPm([string]$Proj) {   # @{ Pm = npm|pnpm|yarn|bun; Spec = name@version from "packageManager" }
+    $pj = Get-Content -LiteralPath (Join-Path $Proj 'package.json') -Raw -ErrorAction SilentlyContinue
+    $res = @{ Pm = 'npm'; Spec = '' }
+    if ($pj -match '"packageManager"\s*:\s*"([a-z]+)@([^"+]+)') { $res.Pm = $Matches[1]; $res.Spec = "$($Matches[1])@$($Matches[2])" }
+    elseif ((Test-Path -LiteralPath (Join-Path $Proj 'bun.lock')) -or (Test-Path -LiteralPath (Join-Path $Proj 'bun.lockb'))) { $res.Pm = 'bun' }
+    elseif (Test-Path -LiteralPath (Join-Path $Proj 'pnpm-lock.yaml')) { $res.Pm = 'pnpm' }
+    elseif (Test-Path -LiteralPath (Join-Path $Proj 'yarn.lock')) { $res.Pm = 'yarn' }
+    if ($res.Pm -notin 'npm', 'pnpm', 'yarn', 'bun') { $res.Pm = 'npm' }
+    return $res
+}
+
+function Get-PmCommand($Pm, [string]$Npm, [string]$Proj) {   # the package manager to run: installed, or fetched for this run
+    $dir = Split-Path $Npm -Parent
+    switch ($Pm.Pm) {
+        'npm' { return @($Npm) }
+        'bun' {
+            foreach ($c in (Join-Path $env:USERPROFILE '.bun\bin\bun.exe')) { if (Test-Path -LiteralPath $c) { return @($c) } }
+            $b = @($script:Rows | Where-Object { $_.Product -eq 'Bun' -and $_.Exe -and (Test-Path -LiteralPath $_.Exe) } | Select-Object -First 1)
+            if ($b.Count) { return @($b[0].Exe) }
+            $g = Get-Command bun.exe -ErrorAction SilentlyContinue; if ($g) { return @($g.Source) }
+            return @((Join-Path $dir 'npx.cmd'), '--yes', 'bun')
+        }
+        default {   # pnpm / yarn
+            $c = Join-Path $dir "$($Pm.Pm).cmd"; if (Test-Path -LiteralPath $c) { return @($c) }
+            $g = Get-Command "$($Pm.Pm).cmd" -ErrorAction SilentlyContinue; if ($g) { return @($g.Source) }
+            $cp = Join-Path $dir 'corepack.cmd'
+            if ($Pm.Spec -and (Test-Path -LiteralPath $cp)) { return @($cp, $Pm.Pm) }   # the exact version the project asks for
+            if ($Pm.Spec) { return @((Join-Path $dir 'npx.cmd'), '--yes', $Pm.Spec) }
+            if ($Pm.Pm -eq 'yarn') {
+                if (Select-String -LiteralPath (Join-Path $Proj 'yarn.lock') -Pattern '^__metadata:' -Quiet -ErrorAction SilentlyContinue) {
+                    if (Test-Path -LiteralPath $cp) { return @($cp, 'yarn') }; return @()   # Yarn 2+ only comes through corepack
+                }
+                return @((Join-Path $dir 'npx.cmd'), '--yes', 'yarn@1')
+            }
+            return @((Join-Path $dir 'npx.cmd'), '--yes', 'pnpm@latest')
+        }
+    }
+}
+
+function Set-Override([string]$Proj, [string]$NodeDir, [string]$Section, [string]$Name, [string]$Range) {   # package.json override, written with node (any workspace format)
+    $js = Join-Path $env:TEMP "vulnpatch-override-$Stamp.js"
+    Set-Content -LiteralPath $js -Encoding ASCII -Value @(
+        'const fs = require("fs"), [file, section, name, range] = process.argv.slice(2);',
+        'const j = JSON.parse(fs.readFileSync(file, "utf8"));',
+        'let o = j; for (const part of section.split(".")) { o[part] = o[part] || {}; o = o[part]; }',
+        'o[name] = range;',
+        'fs.writeFileSync(file, JSON.stringify(j, null, 2) + "\n");')
+    try { return (Invoke-InDir $Proj $NodeDir (Join-Path $NodeDir 'node.exe') @($js, (Join-Path $Proj 'package.json'), $Section, $Name, $Range)) }
+    finally { Remove-Item -LiteralPath $js -Force -ErrorAction SilentlyContinue }
 }
 
 function Invoke-InDir([string]$Dir, [string]$NodeDir, [string]$Exe, [string[]]$CmdArgs) {   # last lines in $script:CmdOut; $true on success
     $oldPath = $env:Path; $env:Path = "$NodeDir;$oldPath"
+    $env:COREPACK_ENABLE_DOWNLOAD_PROMPT = '0'; $env:COREPACK_ENABLE_STRICT = '0'; $env:CI = '1'   # no questions from corepack / pnpm
     $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     Push-Location -LiteralPath $Dir
-    try { $out = @(& $Exe @CmdArgs 2>&1); $code = $LASTEXITCODE } finally { Pop-Location; $ErrorActionPreference = $eap; $env:Path = $oldPath }
+    try { $out = @(& $Exe @CmdArgs 2>&1); $code = $LASTEXITCODE }
+    finally { Pop-Location; $ErrorActionPreference = $eap; $env:Path = $oldPath; Remove-Item Env:\COREPACK_ENABLE_DOWNLOAD_PROMPT, Env:\COREPACK_ENABLE_STRICT, Env:\CI -ErrorAction SilentlyContinue }
     $script:CmdOut = (@($out | ForEach-Object { "$_" } | Where-Object { $_.Trim() } | Select-Object -Last 2) -join ' ')
     return ($code -eq 0)
 }
 
 function Update-Npm($r) {   # next / sharp: the fixed release inside the project, with the project's own package manager
     $spec = Get-NpmSpec $r; $ver = $spec.Substring($spec.IndexOf('@') + 1); $proj = $r.Root
-    $npm = Find-Npm; if (-not $npm) { throw "no npm found - run in the project: npm install $spec" }
-    $nodeDir = Split-Path $npm -Parent; $pm = 'npm'; $tool = $npm
-    if (Test-Path -LiteralPath (Join-Path $proj 'pnpm-lock.yaml')) { $pm = 'pnpm' }
-    if (Test-Path -LiteralPath (Join-Path $proj 'yarn.lock')) { $pm = 'yarn' }
-    if ($pm -ne 'npm') {
-        $tool = Join-Path $nodeDir "$pm.cmd"
-        if (-not (Test-Path -LiteralPath $tool)) {
-            $g = Get-Command "$pm.cmd" -ErrorAction SilentlyContinue
-            if ($g) { $tool = $g.Source } else { throw "this project uses $pm, which is not installed - run in the project: $pm add $spec" }
-        }
-    }
+    $npm = Find-Npm; if (-not $npm) { throw "no Node.js/npm found - run in the project: npm install $spec" }
+    $nodeDir = Split-Path $npm -Parent
+    $pm = Get-ProjectPm $proj
+    $tool = @(Get-PmCommand $pm $npm $proj)
+    if (-not $tool.Count) { throw "this project uses $($pm.Pm) and it could not be started - run in the project: $($pm.Pm) add $spec" }
+    $exe = $tool[0]; $pre = @($tool | Select-Object -Skip 1)
     $bak = Join-Path $BackupDir "$((($proj -replace '[:\\]+', '_').Trim('_')))-npm-$Stamp"
     New-Item -ItemType Directory -Force -Path $bak | Out-Null
-    foreach ($f in 'package.json', 'package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml') {
+    $r.Backups += $bak
+    foreach ($f in 'package.json', 'package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lock', 'bun.lockb') {
         $p = Join-Path $proj $f; if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination $bak }
     }
     $pkg = Get-Content -LiteralPath (Join-Path $proj 'package.json') -Raw | ConvertFrom-Json
@@ -1623,19 +1675,19 @@ function Update-Npm($r) {   # next / sharp: the fixed release inside the project
         $sec = $pkg.$s; if ($sec -and (@($sec.PSObject.Properties | ForEach-Object { $_.Name }) -contains $r.Lib)) { $field = $s; break }
     }
     if ($field) {   # a direct dependency: update it where it is listed
-        if ($pm -eq 'npm') { $a = @('install', $spec, '--no-audit', '--no-fund') } else { $a = @('add', $spec) }
-        if ($field -eq 'devDependencies') { if ($pm -eq 'yarn') { $a += '--dev' } else { $a += '--save-dev' } }
-        $ok = Invoke-InDir $proj $nodeDir $tool $a
+        if ($pm.Pm -eq 'npm') { $a = @('install', $spec, '--no-audit', '--no-fund') } else { $a = @('add', $spec) }
+        if ($field -eq 'devDependencies') { if ($pm.Pm -in 'yarn', 'bun') { $a += '--dev' } else { $a += '--save-dev' } }
+        $ok = Invoke-InDir $proj $nodeDir $exe (@($pre) + $a)
     } else {        # pulled in by another package (sharp via next): pin it with an override
-        $key = "overrides.$($r.Lib)"; if ($pm -eq 'yarn') { $key = "resolutions.$($r.Lib)" } elseif ($pm -eq 'pnpm') { $key = "pnpm.overrides.$($r.Lib)" }
-        $ok = Invoke-InDir $proj $nodeDir $npm @('pkg', 'set', "$key=$ver")
-        if ($ok) { if ($pm -eq 'npm') { $ok = Invoke-InDir $proj $nodeDir $npm @('install', '--no-audit', '--no-fund') } else { $ok = Invoke-InDir $proj $nodeDir $tool @('install') } }
+        $section = 'overrides'; if ($pm.Pm -eq 'yarn') { $section = 'resolutions' } elseif ($pm.Pm -eq 'pnpm') { $section = 'pnpm.overrides' }
+        $ok = Set-Override $proj $nodeDir $section $r.Lib $ver
+        if ($ok) { if ($pm.Pm -eq 'npm') { $ok = Invoke-InDir $proj $nodeDir $exe @('install', '--no-audit', '--no-fund') } else { $ok = Invoke-InDir $proj $nodeDir $exe (@($pre) + @('install')) } }
     }
     $now = ''
     $m = Select-String -LiteralPath (Join-Path $proj "node_modules\$($r.Lib)\package.json") -Pattern '^\s*"version"\s*:\s*"([^"]+)"' -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($m) { $now = $m.Matches[0].Groups[1].Value }
-    if (-not $ok -or -not $now -or (Test-VerLt $now $r.Fixed)) { throw "$pm could not update $($r.Lib) (now $now): $script:CmdOut - backup: $bak" }
-    return "$($pm): $($r.Lib) $($r.Version) -> $now (package.json backup: $bak)"
+    if (-not $ok -or -not $now -or (Test-VerLt $now $r.Fixed)) { throw "$($pm.Pm) could not update $($r.Lib) (now $now): $script:CmdOut - backup: $bak" }
+    return "$($pm.Pm): $($r.Lib) $($r.Version) -> $now (package.json backup: $bak)"
 }
 
 function Update-Bun($r) {   # Bun's own release, SHA-256 checked, swapped for bun.exe in place
@@ -1692,9 +1744,22 @@ function Update-Java($r) {   # the eMudhra block list (CVE-2026-91403) - Oracle'
     return "$pre$($missing.Count) eMudhra certificates added to $f$b - running Java apps need a restart"
 }
 
+function Write-ItemLine($r, [int]$No, [int]$Total, [string]$Word, [string]$Colour, [string]$Reason) {   # the one line an item gets while patching
+    if ($Reason.Length -gt 100) { $Reason = $Reason.Substring(0, 97) + '...' }
+    $w = "$Total".Length
+    Write-Host ("  [{0}/{1}] " -f "$No".PadLeft($w), $Total) -NoNewline
+    Write-Host ('{0,-6} ' -f $Word) -ForegroundColor $Colour -NoNewline
+    $line = '{0,-8} {1,-16} -> {2,-14} {3}' -f (Get-DispProd $r.Product), $r.Version, $r.Fixed, (Get-ShortLoc $r.Root)
+    if ($Reason) { $line += "  - $Reason" }
+    Write-Host $line
+}
+
 function Invoke-Patch {
-    foreach ($r in @($script:PickOrder | Where-Object { $_.Picked })) {
-        Write-Step "$($r.Product) $($r.Version) -> $($r.Fixed)  $($r.Root)"
+    $todo = @($script:PickOrder | Where-Object { $_.Picked }); $n = 0
+    Write-Host ''
+    foreach ($r in $todo) {
+        $n++
+        $script:CurRow = $r   # backups made from here on belong to this item
         try {
             $msg = switch ($r.Kind) {
                 'installer' {
@@ -1722,16 +1787,17 @@ function Invoke-Patch {
                 'chromium'  { Update-Chromium $r }
                 'ca'        { Set-CaDistrust $r }
             }
-            $r.Outcome = "done: $msg"; Write-Ok "$msg"
+            $r.Outcome = "done: $msg"; Write-ItemLine $r $n $todo.Count 'ok' 'Green' ''
         } catch {
-            $r.Outcome = "failed: $($_.Exception.Message)"; Write-Note $r.Outcome
-            Write-Host "      (script line $($_.InvocationInfo.ScriptLineNumber))" -ForegroundColor DarkGray
+            $r.Outcome = "failed: $($_.Exception.Message) (script line $($_.InvocationInfo.ScriptLineNumber))"
+            Write-ItemLine $r $n $todo.Count 'FAILED' 'Red' $_.Exception.Message
         }
     }
+    $script:CurRow = $null
 }
 
 function Show-Verify {
-    $after = @{}
+    $after = @{}; $script:Dropped = 0
     foreach ($x in $script:Rows) { if ($x.Status -ne 'NOT FOUND') { $after[(Get-MatchKey $x)] = $x } }
     Write-Host ("`n  {0,3}  {1,-16} {2,-8} {3,-16}    {4,-16} {5}" -f '#', 'RESULT', 'PRODUCT', 'BEFORE', 'AFTER', 'LOCATION')
     Write-Host "  $Line"
@@ -1741,7 +1807,13 @@ function Show-Verify {
         $a = $after[$r.MatchKey]
         $ast = 'GONE'; $aver = '-'; if ($a) { $ast = $a.Status; $aver = $a.Version }
         $err = ''
-        if ($ast -eq 'PATCHED' -or $ast -eq 'GONE') { $res = 'PATCHED'; if ($ast -eq 'GONE') { $res = 'REMOVED' }; $col = 'Green'; $ok++ }
+        if ($ast -eq 'PATCHED' -or $ast -eq 'GONE') {
+            $res = 'PATCHED'; if ($ast -eq 'GONE') { $res = 'REMOVED' }; $col = 'Green'; $ok++
+            if (-not $KeepBackups -and $r.Backups.Count) {   # fix verified: no old version is left behind
+                foreach ($b in @($r.Backups)) { if (Test-Path -LiteralPath $b) { Remove-Item -LiteralPath $b -Recurse -Force -ErrorAction SilentlyContinue; $script:Dropped++ } }
+                $r.Backups = @(); $r.Outcome = ($r.Outcome -replace ' \((package\.json )?backup: [^)]*\)', '') -replace ', backup: [^)]*\)', ')'
+            }
+        }
         elseif (-not $r.Picked) { $res = 'NOT SELECTED'; $col = 'Yellow'; $skip++; $err = 'not selected in this run' }
         else {
             $res = 'STILL VULNERABLE'; $col = 'Red'; $bad++
@@ -1761,6 +1833,13 @@ function Show-Verify {
     }
     Write-Host "  $Line"
     Write-Host ("  Result: {0} patched, {1} still vulnerable, {2} not selected" -f $ok, $bad, $skip)
+    $kept = @($script:PickOrder | ForEach-Object { @($_.Backups) } | Where-Object { $_ -and (Test-Path -LiteralPath $_) }).Count
+    if ($KeepBackups) { Write-Host "  Backups kept (-KeepBackups): $kept in $BackupDir" }
+    else {
+        $txt = "  Backups: $($script:Dropped) deleted (fix verified - no old versions left)"
+        if ($kept) { $txt += ", $kept kept in $BackupDir for items that are not confirmed (to restore them)" }
+        Write-Host $txt
+    }
     if ($details.Count) { Write-Host "`n  Why these are still vulnerable:"; foreach ($d in $details) { Write-Host "    $d" } }
     $miss = @($script:Rows | Where-Object { $_.Status -eq 'NOT FOUND' } | ForEach-Object { $_.Product })
     if ($miss.Count) { Write-Host "  NOT FOUND (not installed): $($miss -join ', ')" -ForegroundColor DarkGray }
@@ -1771,8 +1850,9 @@ function Show-RestartNeeded {
     $roots = @($script:PickOrder | Where-Object { $_.Picked -and $_.Outcome -like 'done*' } | ForEach-Object { $_.Root.ToLower() })
     $hits = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $p = "$($_.Path)".ToLower(); $p -and @($roots | Where-Object { $p.StartsWith("$_\") }).Count })
     if ($hits.Count) {
-        Write-Host "`n  Restart needed - these processes still run the old code:" -ForegroundColor Yellow
-        foreach ($h in $hits) { Write-Host "    PID $($h.Id)  $($h.Path)" }
+        $g = @($hits | Group-Object { $_.Path } | ForEach-Object { "$($_.Name) ($($_.Count))" })
+        Write-Host "`n  Restart needed - still running the old code: " -ForegroundColor Yellow -NoNewline
+        Write-Host ($g -join ', ')
     }
 }
 
