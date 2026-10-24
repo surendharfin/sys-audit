@@ -14,7 +14,12 @@
 #   PHP2Shell CVE-2026-109618/109619 | Node.js 21-Oct release (CVE-2026-111497 + 9)
 #   eMudhra CA compromise (Python pip/certifi, Firefox, OS trust store)
 #   Chromium 156 security fixes (Chrome, Chromium, Edge, Brave)
+#   Java CVE-2026-91403 (eMudhra intermediates trusted by JSSE) + October 2026 Java CPU
 # Products that are not on the machine at all are listed as NOT FOUND.
+# Every run writes an Excel-ready CSV report to the Desktop of whoever ran it (one file per machine,
+# updated on each run): host, IP, MAC, each copy found, version before / fixed in / after, the result
+# and the error for anything that could not be patched. Docker/Podman/LXD containers and VMs on the
+# machine are listed as NOT SCANNED: they are separate systems - run the script inside each of them.
 #
 # PATCH: every finding gets an automatic action - there are no manual decisions:
 #   apt / dnf / snap / flatpak .. upgrades ONLY packages already installed (adds nothing new)
@@ -25,6 +30,11 @@
 #                                 runtime itself is refreshed in place (Node.js binary / certifi)
 #   Chromium inside apps ........ Chrome for Testing swapped in (Google checksum verified)
 #   Python (any kind) ........... certificate bundle (certifi) refreshed; venvs included
+#   Java (any vendor, any copy) . package update where it has one, then the 16 eMudhra fingerprints
+#                                 added to its lib/security/blocked.certs (Oracle's own fix)
+#   OS trust store .............. ca-certificates update; where the distro has none (Ubuntu 20.04
+#                                 without Pro): emSign ECC Root CA - G3 distrusted directly
+#   distro Firefox package ...... package update; where the distro has none: Mozilla's build swapped in
 #   end-of-life lines ........... moved to the nearest supported line (Node.js, PHP)
 # Every change is backed up first (/var/backups/vulnpatch). After patching the whole machine
 # is scanned again and every copy is reported PATCHED / STILL VULNERABLE (with the reason).
@@ -34,7 +44,9 @@
 #   sudo bash vulnpatch-linux.sh --apply    # detect, ASK which copies to patch, patch, verify
 # Options:
 #   --pick SPEC     (--apply) choose without the prompt: all | 1,3,5-7 | php,node | none
-#   --only LIST     php,node,python,chrome,chromium,edge,brave,firefox,ca (limits the plan)
+#   --only LIST     php,node,python,java,chrome,chromium,edge,brave,firefox,ca (limits the plan)
+#   --report PATH   folder (or .csv file) for the report, e.g. a mounted share
+#                   (default: your Desktop, else Downloads - file vulnpatch-report-<host>.csv)
 #   --no-rebuild    skip PHP/Python source rebuilds (fast run; Python still gets certifi)
 #   --quick         scan common install folders only, not every disk
 #   --json FILE     where to write the JSON report
@@ -57,10 +69,41 @@ EDGE_FIX=156.0.4314.42
 BRAVE_FIX=1.98.60
 FIREFOX_FIX=158.0.1           # ESR: 153.5.1 / 115.43.1
 CERTIFI_FIX=2026.10.19        # first certifi without the compromised eMudhra CAs
-PRODUCTS=(PHP Node.js Python Chrome Edge Firefox Brave)   # listed as NOT FOUND when absent
+declare -A JAVA_FIX=( [8]=8.0.511 [11]=11.0.33 [17]=17.0.21 [21]=21.0.13 [25]=25.0.5 [27]=27.0.1 )   # Oct-2026 CPU (8 = 8u511)
+# CVE-2026-91403: the 16 eMudhra intermediates OpenJDK/Oracle added to lib/security/blocked.certs
+# (JDK-8395142; checked against openjdk/jdk blocked.certs.pem)
+EMUDHRA_FPS=(
+  0164D7CEAE5BB909C272AF151FF44B1177AE9B47D9424B94F1D9558C30934D19 42C4ACCD12C4F59597925E1A08A7A90102608543809308D50EC427E118BA1493
+  432EC25F0D28DE9006D97BF752F17BBB2CD41F669933FCB072D9A1148D0261F3 45A883F349AEDFD5F3A649B5498FFB121712BA8B448F3F2A91DBC5A766FCDDBE
+  4B2460A466F95FD40113BCDCCA2CEB29B3B093921DE45474DA7DF48874C630B1 579480AEA166290BD3C643589E795FC0D0E54E86505D180F1DFF99EFD3199512
+  5F1DED4DD590AF74631290CF073B122A2AAC6A1FA479778A0BD43579BD832699 62B7F9868263F72F6911FC78CEAF72C1979158B7368BF648683BB2AA39B02E72
+  7485B51C0ED192878FA1D2F948FB529AE1842CC5086C4B67F7BE5B2039DE9489 84112972B8E59D14560AE7E7119654474AAD119990CF3722BFC1E3B91615E1FD
+  98B896625C0C230ADEEC3EB2CF6AAD5001ECF9156A68644E82374CE5833BC25B 9E39DE2881273ACC225A149C72BA3E0F51424963669AB633EE1DC7DF5DB067B4
+  A496E23AC0CAB8155FC9B117B97EAE368EFCBB9041AEC8804D5A308D2D01C2D8 CB6E15165AC802E9B3F993F16C25D41F4E81C21EBDE71AE1B012AC00BF9C7C3F
+  E7568FE6E12331F4FD7DE61DA4C7559D0F8EB192A218D4741A3BA75184333838 FD9D5C2DBBD4995AB69B8D50C439D9527B00529199C2FD01B2174EB58F07021F
+)
+# ---- libraries and supply chain (researched 2026-10-24) ----
+PILLOW_FIX=13.0.0                       # CVE-2026-112900 (Ghostscript RCE) + 5 more; needs Python 3.11+
+BROTLI_FIX=1.2.1                        # CVE-2026-111497 (Node2Shell) in the Brotli library itself
+BROTLICFFI_FIX=1.2.1.0
+LITELLM_BAD=(1.107.0 1.82.7 1.82.8)     # malicious releases (credential stealer + remote-control backdoor)
+LITELLM_FIX=1.83.14                     # first release with the April-2026 CVE fixes (CVSS 10.0 RCE)
+LITELLM_SPEC='litellm>=1.106.2,!=1.107.0'
+declare -A NEXT_FIX=( [15]=15.5.28 [16]=16.4.1 )   # 14-Oct-2026: use-cache RCE, image RCE, Server Actions DoS
+SHARP_FIX=0.35.5                        # librsvg RCE through image processing (CVE-2026-96889)
+BUN_FIX=1.4.4                           # CVE-2026-111497 (Node2Shell) in Bun
+KEV_DAYS=30                             # CISA KEV additions of the last N days are matched against installed apps
+KEV_URL=https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json
+# litellm 1.107.0 indicators (Socket / Aikido): SHA-256 of cook.pth, cook.py, sitecustomize.py (two builds each)
+LITELLM_IOC_SHA=(7f191632e7320705d154b85204f1ae546b543acbd7e8861229b76f5042b92bdb 84dc8c82c0a4a4a62552ef826b49fcc86d1a5c4a5d0f2c06665723f93d129d7d
+                 9dd0a3926f96a37eb86cf1ee2310d9be93139cc4ebef3ef9e2efe9531390be25 03ac2a8b752605d1d7710979c17ff18b03dd978203ba23ba97fd8ce3d6f897ea
+                 34bef04fe88ac9d0aae0475630b1738681d15b94f233ac8aa46eacf5968305fa b6122440d0d9cb1eb1ade9933f49214da8c31288de7710c076c2680dfa528465)
+LITELLM_IOC_MARK='remote_code_loader|letters9813|litellm\.dev/healthcheck|XWiA8gZNa7NcX2XRoAEb'
+PRODUCTS=(PHP Node.js Bun Python Java Chrome Edge Firefox Brave LiteLLM Pillow Brotli Next.js sharp)   # listed as NOT FOUND when absent
+SCRIPT_VERSION=2026.10.24
 
 # ---- options ----------------------------------------------------------------
-MODE=plan; ASSUME_YES=0; NO_REBUILD=0; ONLY_PRODUCTS=""; PICK_SPEC=""
+MODE=plan; ASSUME_YES=0; NO_REBUILD=0; ONLY_PRODUCTS=""; PICK_SPEC=""; REPORT_PATH=""; ARGS_TXT="$*"
 QUICK=0; NO_EXEC=0; JSON_OUT=""; CUSTOM_PATHS=""; ROOTS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -74,6 +117,7 @@ while [[ $# -gt 0 ]]; do
     --no-exec)    NO_EXEC=1; shift ;;
     --json)       JSON_OUT=$2; shift 2 ;;
     --paths)      CUSTOM_PATHS=$2; shift 2 ;;
+    --report)     REPORT_PATH=$2; shift 2 ;;
     -h|--help)    if [[ -f $0 ]]; then awk 'NR==1{next} /^set -uo/{exit} {print}' "$0"; else echo "options: --scan | --apply [--pick SPEC] [--only LIST] [--no-rebuild] [--quick] [--json FILE] [-y]"; fi; exit 0 ;;
     *)            echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
   esac
@@ -129,12 +173,34 @@ run_bin() {
     [[ -z $run_as && $owner != root ]] && run_as=$owner
     if [[ -n $run_as ]]; then
       have runuser || return 0
-      timeout 15 runuser -u "$run_as" -- env -i PATH=/usr/bin:/bin HOME=/tmp "$bin" "$@" 2>/dev/null
+      timeout 15 runuser -u "$run_as" -- env -i PATH=/usr/bin:/bin HOME=/tmp "$bin" "$@" 2>"${RUN_BIN_ERR:-/dev/null}"
       return 0
     fi
   fi
-  timeout 15 env -i PATH=/usr/bin:/bin HOME=/tmp "$bin" "$@" 2>/dev/null
+  timeout 15 env -i PATH=/usr/bin:/bin HOME=/tmp "$bin" "$@" 2>"${RUN_BIN_ERR:-/dev/null}"
   return 0
+}
+
+java_norm() {  # 1.8.0_402-b06 -> 8.0.402 | 21.0.5+11 -> 21.0.5 | 25 -> 25.0.0 | 25.0.5.0.2 -> 25.0.5.0.2
+  local v=${1%%[+-]*}
+  if [[ $v =~ ^1\.([0-9]+)\.0_([0-9]+) ]]; then echo "${BASH_REMATCH[1]}.0.${BASH_REMATCH[2]}"
+  elif [[ $v =~ ^1\.([0-9]+)(\.0)?$ ]]; then echo "${BASH_REMATCH[1]}.0.0"
+  elif [[ $v =~ ^[0-9]+$ ]]; then echo "$v.0.0"
+  else first_ver <<<"$v"; fi
+}
+
+java_blockfile() {  # install root -> the block list file that JVM reads (JDK 8: jre/lib/security, blacklisted.certs)
+  local sec=$1/lib/security f
+  if [[ -d $1/jre/lib/security ]]; then sec=$1/jre/lib/security; fi
+  for f in "$sec/blocked.certs" "$sec/blacklisted.certs"; do if [[ -e $f ]]; then echo "$f"; return 0; fi; done
+  echo "$sec/blocked.certs"
+}
+
+java_fp_count() {  # block list file -> how many of the 16 eMudhra fingerprints it holds
+  local f=$1 n=0 fp
+  [[ -r $f ]] || { echo 0; return 0; }
+  for fp in "${EMUDHRA_FPS[@]}"; do if grep -qi "^$fp" "$f"; then n=$((n + 1)); fi; done
+  echo "$n"
 }
 
 node_target() {  # version -> fixed version of the same line, or of the nearest supported line (end-of-life)
@@ -150,15 +216,18 @@ node_target() {  # version -> fixed version of the same line, or of the nearest 
 # DETECTION
 # =============================================================================
 # one row per installation; binaries of the same install (php, php-fpm, php-cgi) are merged
-declare -A R_PROD R_VER R_FIX R_STATUS R_METHOD R_ROOT R_OWNER R_PKGS R_PATHS R_NOTE R_ACTION R_BACKPORT R_CERTIFI R_DEFAULT R_EMBED
+declare -A R_PROD R_VER R_FIX R_STATUS R_METHOD R_ROOT R_OWNER R_PKGS R_PATHS R_NOTE R_ACTION R_BACKPORT R_CERTIFI R_DEFAULT R_EMBED R_VENDOR \
+           R_LIB R_PY R_PYMODE R_PYVER R_MAJOR R_KEV
 KEYS=()
 SKIPPED=0
-VENV_ROOTS=(); VENV_OLD=()
+VENV_ROOTS=(); VENV_OLD=(); KEV_STATE=""
 
 reset_results() {  # clears all rows so the machine can be scanned again (after patching)
-  unset R_PROD R_VER R_FIX R_STATUS R_METHOD R_ROOT R_OWNER R_PKGS R_PATHS R_NOTE R_ACTION R_BACKPORT R_CERTIFI R_DEFAULT R_EMBED
+  unset R_PROD R_VER R_FIX R_STATUS R_METHOD R_ROOT R_OWNER R_PKGS R_PATHS R_NOTE R_ACTION R_BACKPORT R_CERTIFI R_DEFAULT R_EMBED R_VENDOR \
+        R_LIB R_PY R_PYMODE R_PYVER R_MAJOR R_KEV
   declare -gA R_PROD=() R_VER=() R_FIX=() R_STATUS=() R_METHOD=() R_ROOT=() R_OWNER=() R_PKGS=() R_PATHS=() \
-              R_NOTE=() R_ACTION=() R_BACKPORT=() R_CERTIFI=() R_DEFAULT=() R_EMBED=()
+              R_NOTE=() R_ACTION=() R_BACKPORT=() R_CERTIFI=() R_DEFAULT=() R_EMBED=() R_VENDOR=() \
+              R_LIB=() R_PY=() R_PYMODE=() R_PYVER=() R_MAJOR=() R_KEV=()
   KEYS=(); SKIPPED=0; VENV_ROOTS=(); VENV_OLD=()
 }
 
@@ -188,6 +257,7 @@ pkg_is_product() {  # product package -> true when the package IS that product
     Edge)     [[ $2 == microsoft-edge* ]] ;;
     Brave)    [[ $2 == brave-browser* || $2 == brave-origin* ]] ;;
     Firefox)  [[ $2 == firefox* ]] ;;
+    Java)     [[ $2 =~ ^(openjdk|java|jdk|jre|temurin|zulu|.*corretto|oracle-java|msopenjdk|bellsoft|sapmachine|semeru) ]] ;;
     *)        return 1 ;;
   esac
 }
@@ -203,6 +273,8 @@ product_of() {  # real path -> product, empty if not one of ours
     msedge)                          echo Edge ;;
     brave)                           echo Brave ;;
     firefox)                         [[ -f ${p%/*}/application.ini ]] && echo Firefox ;;   # skips wrapper scripts
+    java)                            echo Java ;;
+    bun)                             echo Bun ;;
   esac
   return 0
 }
@@ -216,6 +288,8 @@ method_of_path() {
     */.asdf/installs/*)             echo asdf ;;
     */n/versions/node/*)            echo n ;;
     */.local/share/uv/python/*)     echo uv ;;
+    */.sdkman/candidates/*)         echo sdkman ;;
+    */.jdks/*|*/.jabba/*)           echo jdk-manager ;;
     */miniconda*/*|*/anaconda*/*|*/miniforge*/*|*/mambaforge*/*|*/conda/*) echo conda ;;
     */.cache/puppeteer/*)           echo puppeteer ;;
     */ms-playwright*/*)             echo playwright ;;
@@ -229,6 +303,12 @@ version_of() {  # product binary install-root
   local prod=$1 bin=$2 root=$3 v="" mm h
   if [[ $prod == Firefox ]]; then
     v=$(sed -n 's/^Version=//p' "${bin%/*}/application.ini" 2>/dev/null | head -n1)
+  fi
+  if [[ $prod == Java ]]; then   # every JDK/JRE image has a 'release' file - nothing needs to run
+    v=$(sed -n 's/^JAVA_VERSION="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$root/release" 2>/dev/null | head -n1)
+    if [[ -z $v ]] && (( ! NO_EXEC )); then v=$(RUN_BIN_ERR=/dev/stdout run_bin "$bin" -version | sed -n 's/.*version "\([^"]*\)".*/\1/p' | head -n1); fi
+    [[ -n $v ]] && java_norm "$v"
+    return 0
   fi
   if [[ -z $v ]] && (( ! NO_EXEC )); then
     case $prod in
@@ -260,7 +340,9 @@ scan_file() {
   # real programs only: skips wrapper/shim scripts (snap launchers, pyenv/asdf shims)
   if [[ $(head -c4 "$real" 2>/dev/null) != $'\177ELF' ]]; then SKIPPED=$((SKIPPED + 1)); return 0; fi
   root=${real%/*}
-  case $prod in PHP|Node.js|Python) [[ ${root##*/} == bin || ${root##*/} == sbin ]] && root=${root%/*} ;; esac
+  case $prod in PHP|Node.js|Python|Java|Bun) [[ ${root##*/} == bin || ${root##*/} == sbin ]] && root=${root%/*} ;; esac
+  # JDK 8: jdk/jre/bin/java belongs to the JDK around it
+  if [[ $prod == Java && ${root##*/} == jre && -e ${root%/*}/bin/java ]]; then root=${root%/*}; fi
   root=${root:-/}
 
   if have dpkg && o=$(dpkg -S "$real" 2>/dev/null | head -n1); then
@@ -276,7 +358,7 @@ scan_file() {
   # version says nothing about the runtime, and updating that package comes first
   if [[ -n $pkg ]] && ! pkg_is_product "$prod" "$pkg"; then embedded=1; pkgver=""; fi
 
-  if [[ -n $pkgver ]]; then
+  if [[ -n $pkgver && $prod != Java ]]; then   # Java: the release file is exact (8u422 package numbers are not)
     ver=$(upstream_of "$pkgver")
     case $prod in PHP|Node.js|Python) is_backport "$pkgver" && backport=1 ;; esac
   else
@@ -289,6 +371,7 @@ scan_file() {
   add_row "$key" "$prod" "$ver" "$method" "$root" "$owner" "$pkg" "$real"
   (( backport )) && R_BACKPORT[$key]=1
   (( embedded )) && R_EMBED[$key]=1
+  if [[ $prod == Java ]]; then R_VENDOR[$key]=$(sed -n 's/^IMPLEMENTOR="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$root/release" 2>/dev/null | head -n1); fi
   [[ -n ${ACTIVE[$real]:-} ]] && R_DEFAULT[$key]=${ACTIVE[$real]}
   return 0
 }
@@ -399,6 +482,163 @@ scan_venvs() {  # one row for all Python virtual environments (their certifi liv
   fi
 }
 
+# ---- libraries inside Python environments and Node.js projects ------------
+pyenv_of() {  # site-packages dir -> PE_PY (interpreter) / PE_MODE (env | user | system | pkg) / PE_VER (3.X)
+  local sp=$1 pre mm c
+  PE_PY=""; PE_MODE=env
+  mm=$(grep -oE 'python3\.[0-9]+' <<<"$sp" | tail -n1); PE_VER=${mm#python}
+  if [[ $sp == /usr/lib/python3/dist-packages || ( $sp == /usr/lib/* && $sp == */site-packages ) ]]; then
+    PE_MODE=pkg; PE_PY=/usr/bin/python3                                  # the distro's own Python
+  elif [[ $sp == /usr/local/lib/python3*/dist-packages ]]; then
+    PE_MODE=system; PE_PY=/usr/bin/$mm                                   # pip as root into the system Python
+  elif [[ $sp == */.local/lib/python3*/site-packages ]]; then
+    PE_MODE=user; PE_PY=/usr/bin/$mm; [[ -x $PE_PY ]] || PE_PY=/usr/bin/python3
+  else                                                                   # venv, conda, pyenv, uv, tarball, app bundle
+    pre=${sp%/lib/python3*}
+    for c in "$pre/bin/$mm" "$pre/bin/python3" "$pre/bin/python"; do if [[ -x $c ]]; then PE_PY=$c; break; fi; done
+    if [[ -f $pre/pyvenv.cfg ]]; then
+      c=$(sed -nE 's/^version(_info)? *= *([0-9]+\.[0-9]+).*/\2/p' "$pre/pyvenv.cfg" | head -n1); [[ -n $c ]] && PE_VER=$c
+    fi
+  fi
+  if [[ -z $PE_VER && -n $PE_PY && -x $PE_PY ]]; then PE_VER=$(run_bin "$PE_PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])'); fi
+  return 0
+}
+
+scan_pydist() {  # <site-packages>/<name>-<version>.dist-info -> Pillow / Brotli / LiteLLM row
+  local d=$1 sp=${1%/*} base=${1##*/} name prod ver key o pkg="" pkgver=""
+  case $sp in */.cache/uv/*|*/.cache/pip/*|*/archive-v[0-9]*/*) return 0 ;; esac   # download caches, not Python environments
+  name=${base%%-*}; name=${name,,}
+  case $name in pillow) prod=Pillow ;; brotli|brotlicffi) prod=Brotli ;; litellm) prod=LiteLLM ;; *) return 0 ;; esac
+  ver=$(sed -n 's/^Version: *//p' "$d/METADATA" 2>/dev/null | head -n1 | tr -d '\r')
+  if [[ -z $ver ]]; then ver=${base#*-}; ver=${ver%.dist-info}; fi
+  pyenv_of "$sp"
+  key="$prod|$sp|$name"
+  add_row "$key" "$prod" "$ver" pip "$sp" "$(owner_of "$sp")" "$name" "$d"
+  R_LIB[$key]=$name; R_PY[$key]=$PE_PY; R_PYMODE[$key]=$PE_MODE; R_PYVER[$key]=$PE_VER
+  if [[ $PE_MODE == pkg ]]; then   # python3-pil & co. come from the distro: updated through its package
+    if have dpkg && o=$(dpkg -S "$d" 2>/dev/null | head -n1); then
+      pkg=${o%%: *}; pkg=${pkg%%:*}; pkgver=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)
+    elif have rpm && o=$(rpm -qf --qf '%{NAME}|%{VERSION}-%{RELEASE}\n' "$d" 2>/dev/null | head -n1) && [[ $o == *'|'* ]]; then
+      pkg=${o%%|*}; pkgver=${o#*|}
+    fi
+    if [[ -n $pkg ]]; then R_METHOD[$key]=apt; [[ $o == *'|'* ]] && R_METHOD[$key]=rpm; R_PKGS[$key]=$pkg; is_backport "$pkgver" && R_BACKPORT[$key]=1
+    else R_PYMODE[$key]=system; fi                                       # pip-installed into the distro Python
+  fi
+  return 0
+}
+
+scan_npm() {  # <project>/node_modules/.../{next,sharp}/package.json -> one row per project (lowest copy)
+  local f=$1 dir=${1%/package.json} name prod ver proj key
+  name=${dir##*/}
+  case $name in next) prod=Next.js ;; sharp) prod=sharp ;; *) return 0 ;; esac
+  ver=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1)
+  [[ $ver =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 0                    # canary / pre-releases: not rated
+  proj=${f%%/node_modules/*}
+  [[ -f $proj/package.json ]] || return 0                                # global / cache copy without a project
+  key="$prod|$proj|"
+  if [[ -n ${R_PROD[$key]+x} ]]; then
+    if ver_lt "$ver" "${R_VER[$key]}"; then R_VER[$key]=$ver; fi
+    R_PATHS[$key]+=";$f"; return 0
+  fi
+  add_row "$key" "$prod" "$ver" npm "$proj" "$(owner_of "$proj")" "$name" "$f"
+  R_LIB[$key]=$name
+}
+
+is_litellm_ioc() {  # file -> true when it is one of the known malicious litellm 1.107.0 files
+  local h
+  h=$(sha256sum "$1" 2>/dev/null | cut -d' ' -f1)
+  [[ -n $h && " ${LITELLM_IOC_SHA[*]} " == *" $h "* ]] && return 0
+  [[ ${1##*/} == cook.pth ]] && grep -qx 'import cook' "$1" 2>/dev/null && return 0
+  grep -qE "$LITELLM_IOC_MARK" "$1" 2>/dev/null
+}
+
+scan_ioc() {  # <site-packages>/cook.pth of the litellm 1.107.0 malware (it stays after an uninstall)
+  local f=$1 sp=${1%/*} key
+  is_litellm_ioc "$f" || return 0
+  key="LiteLLM malware|$sp|"
+  add_row "$key" "LiteLLM malware" "1.107.0 hooks" ioc "$sp" "$(owner_of "$sp")" "" "$f"
+}
+
+lib_verdict() {  # libraries, Bun and the malware rows
+  local k=$1 v=${R_VER[$1]} p=${R_PROD[$1]} fix="" st="" note="" b
+  case $p in
+    Pillow)  fix=$PILLOW_FIX; note="CVE-2026-112900 (Ghostscript RCE) and 5 more" ;;
+    Brotli)  if [[ ${R_LIB[$k]} == brotlicffi ]]; then fix=$BROTLICFFI_FIX; else fix=$BROTLI_FIX; fi
+             note="CVE-2026-111497 (Node2Shell) in the Brotli decoder"
+             if ver_lt "$v" 1.0.3; then st=PATCHED; note="older than the affected range (1.0.3+)"; fi ;;
+    LiteLLM) if [[ " ${LITELLM_BAD[*]} " == *" $v "* ]]; then
+               st=COMPROMISED; fix=1.106.2; note="MALICIOUS RELEASE (credential stealer + backdoor) - rotate every credential used on this machine"
+             else fix=$LITELLM_FIX; note="April-2026 CVEs (CVSS 10.0 RCE)"; fi ;;
+    Next.js) b=${v%%.*}; fix=${NEXT_FIX[$b]:-}; note="use-cache RCE, image-optimisation RCE, Server Actions DoS (14 Oct 2026)"
+             if [[ -z $fix ]]; then
+               if (( b > 16 )); then st=PATCHED; fix=-; note="newer line"
+               else st=VULNERABLE; fix=${NEXT_FIX[15]}; R_MAJOR[$k]=1
+                    note="Next.js $b has no fixed release - the project has to move to Next.js ${NEXT_FIX[15]} / ${NEXT_FIX[16]} (major upgrade)"; fi
+             fi ;;
+    sharp)   fix=$SHARP_FIX; note="librsvg RCE in image processing (CVE-2026-96889)" ;;
+    Bun)     fix=$BUN_FIX; note="CVE-2026-111497 (Node2Shell) in Bun's Brotli decoder" ;;
+    "LiteLLM malware") st=COMPROMISED; fix=removed
+             note="litellm 1.107.0 startup hooks (cook.pth / sitecustomize.py) - rotate every credential used on this machine"
+             if [[ -e /tmp/.pc_once_72129118c59f5636c0bb ]]; then note+="; the stealer has already run here"; fi ;;
+  esac
+  if [[ -z $st ]]; then if ver_lt "$v" "$fix"; then st=VULNERABLE; else st=PATCHED; note=""; fi; fi
+  if [[ -n ${R_BACKPORT[$k]:-} && $st == VULNERABLE ]]; then
+    st=REVIEW; note="distro package: fixes are backported - updated through the distro's own packages"
+  fi
+  R_STATUS[$k]=$st; R_FIX[$k]=$fix; R_NOTE[$k]=$note
+}
+
+# ---- CISA Known Exploited Vulnerabilities: recent additions vs. installed packages
+scan_kev() {
+  have python3 || return 0
+  local since json src pkg ver name cve date act key cand newer
+  since=$(date -d "-$KEV_DAYS days" +%F 2>/dev/null) || return 0
+  json=$(mktemp /var/tmp/vulnpatch-kev.XXXXXX 2>/dev/null || mktemp)
+  if ! curl -fsSL --max-time 60 -o "$json" "$KEV_URL" 2>/dev/null; then rm -f "$json"; KEV_STATE="CISA KEV list could not be downloaded"; return 0; fi
+  KEV_STATE=""
+  while IFS=$'\t' read -r src pkg ver name cve date act; do
+    key="KEV: $name|$src:$pkg|"
+    if [[ -n ${R_PROD[$key]+x} ]]; then R_KEV[$key]+=", $cve"; continue; fi
+    add_row "$key" "KEV: $name" "$ver" "$src" "$src:$pkg" root "$pkg" ""
+    R_KEV[$key]="$cve"
+    newer=""
+    case $src in
+      apt)  cand=$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/ {print $2}')
+            if [[ -n $cand && $cand != "(none)" ]] && dpkg --compare-versions "$cand" gt "$ver" 2>/dev/null; then newer=$cand; fi ;;
+      rpm)  cand=$(timeout 60 "$PKGMGR" -q list --upgrades "$pkg" 2>/dev/null | awk -v p="$pkg" '$1 ~ "^"p"\\." {print $2}' | head -n1); newer=$cand ;;
+      snap) if snap refresh --list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$pkg"; then newer=newer; fi ;;
+    esac
+    R_FIX[$key]=${newer:-latest}
+    if [[ -n $newer ]]; then R_STATUS[$key]=VULNERABLE; R_NOTE[$key]="CISA KEV (actively exploited, added $date): CVES - update available ($newer)"
+    else R_STATUS[$key]=PATCHED; R_NOTE[$key]="CISA KEV (actively exploited, added $date): CVES - newest available version is installed; confirm with the vendor advisory: $act"; fi
+  done < <( { if have dpkg-query; then dpkg-query -W -f='${db:Status-Abbrev}\t${Package}\t${Version}\n' 2>/dev/null | awk -F'\t' '$1 ~ /^ii/ {print "apt\t" $2 "\t" $3}'; fi
+              if [[ $PKGMGR != apt ]] && have rpm; then rpm -qa --qf 'rpm\t%{NAME}\t%{VERSION}-%{RELEASE}\n' 2>/dev/null; fi
+              if have snap; then snap list 2>/dev/null | awk 'NR > 1 {print "snap\t" $1 "\t" $2}'; fi; } | python3 -I -c '
+import json, re, sys
+def n(s): return re.sub(r"[^a-z0-9]", "", s.lower())
+kev = json.load(open(sys.argv[1], encoding="utf-8"))["vulnerabilities"]
+# already handled by this script, part of the OS (kernel updates), or too generic to match
+skip = re.compile(r"chrom|firefox|edge|java|node\.?js|php|python|kernel|windows|multiple products|android|ios|macos", re.I)
+inst = [l.rstrip("\n").split("\t") for l in sys.stdin if l.count("\t") == 2]
+for v in kev:
+    if v["dateAdded"] < sys.argv[2] or skip.search(v["vendorProject"] + " " + v["product"]): continue
+    vend, prod = n(v["vendorProject"]), n(v["product"])
+    cands = {vend + prod} | ({prod} if len(prod) >= 5 else set())
+    for src, pkg, ver in inst:
+        whole, base = n(pkg), n(pkg.split("-")[0])
+        if whole in cands or base in cands or (len(re.sub(r"\d+$", "", base)) >= 5 and re.sub(r"\d+$", "", base) in cands):
+            name = v["product"] if v["product"].lower().startswith(v["vendorProject"].split()[0].lower()) else v["vendorProject"] + " " + v["product"]
+            print("\t".join([src, pkg, ver, name, v["cveID"], v["dateAdded"], " ".join(v["requiredAction"].split())[:200]]))
+' "$json" "$since" 2>/dev/null)
+  rm -f "$json"
+  if (( ${#KEYS[@]} )); then
+    for key in "${KEYS[@]}"; do   # the CVE list goes into the note once all are collected
+      if [[ -n ${R_KEV[$key]:-} ]]; then R_NOTE[$key]=${R_NOTE[$key]/CVES/${R_KEV[$key]}}; fi
+    done
+  fi
+  return 0
+}
+
 add_missing() {  # products with no copy at all are listed as NOT FOUND
   local p k found
   for p in "${PRODUCTS[@]}"; do
@@ -470,11 +710,27 @@ certifi_check() {  # flags Python installs whose bundled certifi still trusts th
   fi
 }
 
+java_verdict() {  # rated on the eMudhra block list (CVE-2026-91403); the October CPU version is reported with it
+  local k=$1 v=${R_VER[$1]} major fix n f note
+  major=${v%%.*}; fix=${JAVA_FIX[$major]:-}
+  f=$(java_blockfile "${R_ROOT[$k]}"); n=$(java_fp_count "$f")
+  R_FIX[$k]=${fix:--}
+  if (( n == ${#EMUDHRA_FPS[@]} )); then R_STATUS[$k]=PATCHED; note="eMudhra certificates blocked (CVE-2026-91403)"
+  else R_STATUS[$k]=VULNERABLE; note="CVE-2026-91403: $n of ${#EMUDHRA_FPS[@]} eMudhra certificates blocked in ${f##*/}"; fi
+  if [[ -z $fix ]]; then note+="; Java $major is end-of-life (no more updates) - plan a move to Java 21 or 25"
+  elif ver_lt "$v" "$fix"; then note+="; older than the October 2026 update ($fix)"; fi
+  if [[ -n ${R_VENDOR[$k]:-} ]]; then note+="; ${R_VENDOR[$k]}"; fi
+  if [[ -n ${R_EMBED[$k]:-} ]]; then note+="; built into package '${R_PKGS[$k]}'"; fi
+  R_NOTE[$k]=$note
+}
+
 finalize() {
   local k
   (( ${#KEYS[@]} )) || return 0
   for k in "${KEYS[@]}"; do
-    [[ ${R_PROD[$k]} == "CA store" || ${R_METHOD[$k]} == venv ]] && continue     # rated while scanning
+    [[ ${R_PROD[$k]} == "CA store" || ${R_PROD[$k]} == KEV:* || ${R_METHOD[$k]} == venv ]] && continue     # rated while scanning
+    if [[ ${R_PROD[$k]} == Java ]]; then java_verdict "$k"; continue; fi
+    case ${R_PROD[$k]} in Pillow|Brotli|LiteLLM|Next.js|sharp|Bun|"LiteLLM malware") lib_verdict "$k"; continue ;; esac
     verdict "${R_PROD[$k]}" "${R_VER[$k]}" "${R_BACKPORT[$k]:-0}"
     R_STATUS[$k]=$V_STATUS; R_FIX[$k]=$V_FIXED; R_NOTE[$k]=$V_NOTE
     if [[ ${R_PROD[$k]} == Python && -n ${R_BACKPORT[$k]:-} ]]; then
@@ -512,23 +768,33 @@ scan_machine() {   # finds every copy on the machine and rates it (fills KEYS / 
   (( ${#ROOTS[@]} )) || scan_roots
   for r in "${ROOTS[@]}"; do
     while IFS= read -r -d '' f; do
-      if [[ $f == */pyvenv.cfg ]]; then VENV_ROOTS+=("${f%/pyvenv.cfg}"); else scan_file "$f"; fi
+      case $f in
+        */pyvenv.cfg)   VENV_ROOTS+=("${f%/pyvenv.cfg}") ;;
+        *.dist-info)    scan_pydist "$f" ;;
+        */package.json) scan_npm "$f" ;;
+        */cook.pth)     scan_ioc "$f" ;;
+        *)              scan_file "$f" ;;
+      esac
     done < <(
       find "$r" -xdev -regextype posix-extended \
         \( -path /proc -o -path /sys -o -path /dev -o -path /run -o -path /snap -o -path /var/lib/snapd \
            -o -path /var/lib/docker -o -path /var/lib/containerd -o -path /var/lib/containers \
            -o -path /var/lib/flatpak -o -path '*/.local/share/flatpak' -o -path '*/.local/share/containers' \
            -o -path '*/.vulnpatch.*' -o -path '/var/tmp/vulnpatch-*' -o -path "$BACKUP_DIR" \) -prune \
+        -o -type d \( -iname 'pillow-*.dist-info' -o -iname 'brotli-*.dist-info' -o -iname 'brotlicffi-*.dist-info' \
+           -o -iname 'litellm-*.dist-info' \) -print0 -prune \
         -o -type f \( -perm /111 \( -name php -o -name 'php[0-9]*' -o -name 'php-fpm*' -o -name 'php-cgi*' \
            -o -name node -o -name nodejs -o -regex '.*/python3(\.[0-9]+t?)?' \
-           -o -name chrome -o -name chromium -o -name chromium-browser -o -name msedge -o -name brave -o -name firefox \) \
-           -o -name pyvenv.cfg \) \
+           -o -name chrome -o -name chromium -o -name chromium-browser -o -name msedge -o -name brave -o -name firefox -o -name java \
+           -o -name bun \) \
+           -o -name pyvenv.cfg -o -name cook.pth -o -path '*/node_modules/next/package.json' -o -path '*/node_modules/sharp/package.json' \) \
         -print0 2>/dev/null)
   done
   scan_snaps
   scan_flatpaks
   scan_trust_store
   scan_venvs
+  scan_kev
   finalize
   add_missing
   if (( ${#KEYS[@]} )); then
@@ -545,7 +811,7 @@ report() {  # full table + why + automatic fix (scan mode)
   if (( ${#KEYS[@]} == 0 )); then echo "  nothing found"; return 0; fi
   for k in "${KEYS[@]}"; do
     case ${R_STATUS[$k]} in
-      VULNERABLE)  rank=0; n_vuln=$((n_vuln + 1)) ;;
+      VULNERABLE|COMPROMISED) rank=0; n_vuln=$((n_vuln + 1)) ;;
       EOL)         rank=1; n_eol=$((n_eol + 1)) ;;
       REVIEW)      rank=2; n_rev=$((n_rev + 1)) ;;
       "NOT FOUND") rank=4; n_miss=$((n_miss + 1)); missing+=("${R_PROD[$k]}") ;;
@@ -559,8 +825,8 @@ report() {  # full table + why + automatic fix (scan mode)
   printf '  %s\n' "$LINE"
   for line in "${order[@]}"; do
     k=${line#*|}; k=${k#*|}
-    case ${R_STATUS[$k]} in VULNERABLE|EOL) col=$RED ;; REVIEW) col=$YEL ;; PATCHED) col=$GRN ;; *) col=$DIM ;; esac
-    printf '  %s%-11s%s %-9s %-16s %-15s %s\n' "$col" "${R_STATUS[$k]}" "$RST" "${R_PROD[$k]}" \
+    case ${R_STATUS[$k]} in VULNERABLE|EOL|COMPROMISED) col=$RED ;; REVIEW) col=$YEL ;; PATCHED) col=$GRN ;; *) col=$DIM ;; esac
+    printf '  %s%-11s%s %-9s %-16s %-15s %s\n' "$col" "${R_STATUS[$k]}" "$RST" "$(disp_prod "${R_PROD[$k]}")" \
       "${R_VER[$k]}" "${R_FIX[$k]:--}" "$(short_loc "${R_ROOT[$k]}")"
   done
 
@@ -623,7 +889,8 @@ write_json() {  # file
 # =============================================================================
 # PLAN - every finding gets an automatic action
 # =============================================================================
-prod_token() { case $1 in Node.js) echo node ;; "CA store") echo ca ;; *) echo "${1,,}" ;; esac; }
+prod_token() { case $1 in Node.js) echo node ;; Next.js) echo next ;; "CA store") echo ca ;; "LiteLLM malware") echo litellm ;; KEV:*) echo kev ;; *) echo "${1,,}" ;; esac; }
+disp_prod() { case $1 in KEV:*) echo KEV ;; "LiteLLM malware") echo MALWARE ;; *) echo "$1" ;; esac; }   # fits the 8-wide column
 selected()   { [[ -z $ONLY_PRODUCTS || ",$ONLY_PRODUCTS," == *",$(prod_token "$1"),"* ]]; }
 
 # key that survives a patch (the version changes, the product/location/branch does not)
@@ -634,10 +901,11 @@ match_key() {
     Node.js)    br=${v%%.*} ;;
   esac
   [[ ${R_METHOD[$k]} == venv ]] && br=""
+  [[ -n ${R_LIB[$k]:-} ]] && br=${R_LIB[$k]}   # libraries: brotli and brotlicffi can share a site-packages
   printf '%s|%s|%s' "${R_PROD[$k]}" "${R_ROOT[$k]}" "$br"
 }
 
-declare -A PLAN_KIND PLAN_DESC PLAN_PKGS PICKED OUTCOME B_MK B_VER B_PROD B_ROOT B_METHOD NOTE_PKG DEPS_DONE
+declare -A IN_PLAN PLAN_KIND PLAN_DESC PLAN_PKGS PICKED OUTCOME B_MK B_VER B_PROD B_ROOT B_METHOD B_FIX B_DESC B_NOTE NOTE_PKG DEPS_DONE
 PLAN_ORDER=(); DISPLAY_ORDER=(); PICK_ORDER=(); EXTERNAL_ORDER=(); PKGS=(); SNAPS=(); FLATPAKS=()
 
 add_unique() {  # array-name value...
@@ -666,19 +934,48 @@ runas_for() {  # key -> the account a rebuild runs as (system locations: root)
   if [[ $o == root || $o == uid:* || $o == '?' || $o == '-' ]]; then echo root; else echo "$o"; fi
 }
 
+lib_spec() {  # key -> pip requirement of the fixed release
+  case ${R_LIB[$1]} in
+    pillow) echo "pillow>=$PILLOW_FIX" ;; brotli) echo "brotli>=$BROTLI_FIX" ;;
+    brotlicffi) echo "brotlicffi>=$BROTLICFFI_FIX" ;; litellm) echo "$LITELLM_SPEC" ;;
+  esac
+}
+npm_spec() {  # key -> npm package@range of the fixed release (same major line)
+  if [[ ${R_LIB[$1]} == sharp ]]; then echo "sharp@^$SHARP_FIX"; else echo "next@^${NEXT_FIX[${R_VER[$1]%%.*}]}"; fi
+}
+
 set_kind() {  # picks the automatic action for one finding (PLAN_KIND / PLAN_DESC / PLAN_PKGS)
   local k=$1 p=${R_PROD[$1]} m=${R_METHOD[$1]} st=${R_STATUS[$1]} list pre=""
   PLAN_PKGS[$k]=""
   if [[ -n ${R_EMBED[$k]:-} ]]; then
     PLAN_PKGS[$k]=${R_PKGS[$k]}; pre="upgrade package '${R_PKGS[$k]}', then "
   fi
-  if [[ $p == "CA store" ]]; then
-    PLAN_KIND[$k]=pkg; PLAN_PKGS[$k]=ca-certificates; PLAN_DESC[$k]="upgrade ca-certificates (removes the emSign G3 root)"
+  if [[ $p == "LiteLLM malware" ]]; then
+    PLAN_KIND[$k]=ioc; PLAN_DESC[$k]="quarantine the malicious startup files, stop the backdoor, block its server - then ROTATE credentials"
+  elif [[ $m == pip ]]; then
+    if [[ $st == COMPROMISED ]]; then
+      PLAN_KIND[$k]=litellm; PLAN_DESC[$k]="remove malicious litellm ${R_VER[$k]} and its startup files, install clean litellm - then ROTATE credentials"
+    else PLAN_KIND[$k]=pip; PLAN_DESC[$k]="pip install -U '$(lib_spec "$k")' in this Python (as $(runas_for "$k"))"; fi
+  elif [[ $m == npm ]]; then
+    if [[ -n ${R_MAJOR[$k]:-} ]]; then PLAN_KIND[$k]=external; PLAN_DESC[$k]=${R_NOTE[$k]}
+    else PLAN_KIND[$k]=npm; PLAN_DESC[$k]="update to $(npm_spec "$k") in this project (package.json + lock file backed up)"; fi
+  elif [[ $p == Bun ]]; then
+    PLAN_KIND[$k]=bun; PLAN_DESC[$k]="Bun $BUN_FIX swapped in (SHA-256 checked)"
+  elif [[ $p == "CA store" ]]; then
+    PLAN_KIND[$k]=ca; PLAN_PKGS[$k]=ca-certificates
+    PLAN_DESC[$k]="upgrade ca-certificates; if this release has no fixed package: distrust emSign ECC Root CA - G3"
   elif [[ $m == venv ]]; then
     PLAN_KIND[$k]=venvs; PLAN_DESC[$k]="refresh certifi in ${#VENV_ROOTS[@]} virtualenvs"
+  elif [[ $p == Java ]]; then
+    PLAN_KIND[$k]=java
+    if [[ $m == apt || $m == rpm ]]; then PLAN_PKGS[$k]=${R_PKGS[$k]}; fi
+    PLAN_DESC[$k]="${PLAN_PKGS[$k]:+upgrade package(s) ${PLAN_PKGS[$k]}, then }add the eMudhra fingerprints to $(basename "$(java_blockfile "${R_ROOT[$k]}")")"
   elif [[ -z ${R_EMBED[$k]:-} && ( $m == apt || $m == rpm ) ]]; then
     list=$(pkg_list_for "$k"); PLAN_PKGS[$k]=${list% }
     PLAN_KIND[$k]=pkg; PLAN_DESC[$k]="upgrade installed package(s): ${list% }"
+    if [[ $p == Firefox ]]; then   # e.g. Ubuntu 20.04 without Pro: the archive has no fixed Firefox
+      PLAN_KIND[$k]=firefox-pkg; PLAN_DESC[$k]+="; if the distro has no fixed build: Mozilla's Firefox ${R_FIX[$k]} swapped in"
+    fi
   elif [[ $m == snap ]]; then
     PLAN_KIND[$k]=snap; PLAN_PKGS[$k]=${R_PKGS[$k]}; PLAN_DESC[$k]="snap refresh ${R_PKGS[$k]}"
   elif [[ $m == flatpak-system ]]; then
@@ -719,14 +1016,15 @@ build_plan() {
   for k in "${KEYS[@]}"; do
     [[ ${R_STATUS[$k]} == PATCHED || ${R_STATUS[$k]} == "NOT FOUND" ]] && continue
     selected "${R_PROD[$k]}" || continue
-    PLAN_ORDER+=("$k")
+    PLAN_ORDER+=("$k"); IN_PLAN[$k]=1
     set_kind "$k"
   done
 }
 
 prod_rank() {
-  case $1 in PHP) echo 1 ;; Node.js) echo 2 ;; Python) echo 3 ;; Chrome) echo 4 ;; Chromium) echo 5 ;;
-             Edge) echo 6 ;; Brave) echo 7 ;; Firefox) echo 8 ;; *) echo 9 ;; esac
+  case $1 in "LiteLLM malware") echo 0 ;; PHP) echo 1 ;; Node.js) echo 2 ;; Bun) echo 3 ;; Python) echo 4 ;; Java) echo 5 ;;
+             Chrome) echo 6 ;; Chromium) echo 7 ;; Edge) echo 8 ;; Brave) echo 9 ;; Firefox) echo 10 ;; LiteLLM) echo 11 ;;
+             Pillow) echo 12 ;; Brotli) echo 13 ;; Next.js) echo 14 ;; sharp) echo 15 ;; KEV:*) echo 16 ;; *) echo 17 ;; esac
 }
 
 # DISPLAY_ORDER = plan grouped by product, then version, then location
@@ -755,6 +1053,12 @@ action_label() {
     rebuild)                    echo "rebuild" ;;
     node|node-bin|firefox|chromium) echo "replace" ;;
     certifi|venvs)              echo "certifi" ;;
+    java)                       echo "blocklist" ;;
+    ca)                         echo "distrust" ;;
+    pip)                        echo "pip update" ;;
+    npm)                        echo "npm update" ;;
+    litellm|ioc)                echo "clean" ;;
+    bun)                        echo "replace" ;;
     external)                   echo "-" ;;
     *)                          echo "update" ;;      # apt / dnf / snap / flatpak package update
   esac
@@ -763,7 +1067,7 @@ action_label() {
 est_min() {  # key -> rough minutes for that item (source builds dominate)
   case ${PLAN_KIND[$1]} in
     rebuild)  if [[ ${R_PROD[$1]} == PHP ]]; then echo 5; else echo 4; fi ;;
-    chromium) echo 2 ;;
+    chromium|npm) echo 2 ;;
     *)        echo 1 ;;
   esac
 }
@@ -776,7 +1080,7 @@ print_plan() {
   printf '  %s\n' "$LINE"
   for k in "${PICK_ORDER[@]}"; do
     i=$((i + 1)); m=$(est_min "$k"); total=$((total + m))
-    printf '  %3d  %-8s %-16s -> %-14s %-11s %3sm  %s\n' "$i" "${R_PROD[$k]}" "${R_VER[$k]}" "${R_FIX[$k]:--}" \
+    printf '  %3d  %-8s %-16s -> %-14s %-11s %3sm  %s\n' "$i" "$(disp_prod "${R_PROD[$k]}")" "${R_VER[$k]}" "${R_FIX[$k]:--}" \
       "$(action_label "$k")" "$m" "$(short_loc "${R_ROOT[$k]}")"
   done
   (( i )) || printf '       %s(nothing to patch)%s\n' "$DIM" "$RST"
@@ -786,6 +1090,10 @@ print_plan() {
   printf '  %sreplace%s = the fixed release swapped into the same folder (runtimes inside apps: package first)\n' "$DIM" "$RST"
   printf '  %supdate%s  = normal package update (only packages that are already installed)\n' "$DIM" "$RST"
   printf '  %scertifi%s = refresh the certificate bundle inside that Python (removes the compromised eMudhra CAs)\n' "$DIM" "$RST"
+  printf '  %sblocklist%s = add the 16 eMudhra certificates to that Java'"'"'s blocked.certs   |   %sdistrust%s = take emSign G3 out of the OS trust store\n' "$DIM" "$RST" "$DIM" "$RST"
+  printf '  %spip / npm update%s = the fixed version installed in that Python environment / project (package.json + lock file backed up)\n' "$DIM" "$RST"
+  printf '  %sclean%s = malicious files quarantined, backdoor stopped, clean version installed - credentials must be ROTATED\n' "$DIM" "$RST"
+  printf '  %sKEV%s = on the CISA list of actively exploited vulnerabilities - updated to the newest version available\n' "$DIM" "$RST"
   printf '  %sEvery change is backed up first to %s%s\n' "$DIM" "$BACKUP_DIR" "$RST"
   if (( ${#EXTERNAL_ORDER[@]} )); then
     printf '\n  %sUpdated outside this script (%d):%s\n' "$DIM" "${#EXTERNAL_ORDER[@]}" "$RST"
@@ -801,7 +1109,7 @@ report_brief() {  # plan/apply mode: counts + what is already fine (full table: 
   (( ${#KEYS[@]} )) || { echo "  nothing found"; return 0; }
   for k in "${KEYS[@]}"; do
     case ${R_STATUS[$k]} in
-      VULNERABLE) n_v=$((n_v + 1)) ;; EOL) n_e=$((n_e + 1)) ;; REVIEW) n_r=$((n_r + 1)) ;; "NOT FOUND") ;; *) n_p=$((n_p + 1)) ;;
+      VULNERABLE|COMPROMISED) n_v=$((n_v + 1)) ;; EOL) n_e=$((n_e + 1)) ;; REVIEW) n_r=$((n_r + 1)) ;; "NOT FOUND") ;; *) n_p=$((n_p + 1)) ;;
     esac
   done
   n_f=$((n_v + n_e + n_r + n_p))
@@ -855,7 +1163,7 @@ choose_items() {  # asks (or takes --pick) which plan items to patch; returns 1 
       printf '\n  Which copies should be patched?\n'
       printf '    all          every numbered item\n'
       printf '    1,3,5-7      only those numbers from the list above\n'
-      printf '    php,node     everything of those products (php node python chrome chromium edge brave firefox ca)\n'
+      printf '    php,node     everything of those products (php node bun python java chrome chromium edge brave firefox ca litellm pillow brotli next sharp kev)\n'
       printf '    none         cancel\n'
       read -r -p "  Your choice [all]: " answer <"$TTY_IN"
       PICKED=()
@@ -870,7 +1178,7 @@ choose_items() {  # asks (or takes --pick) which plan items to patch; returns 1 
   for k in "${PICK_ORDER[@]}"; do
     n=$((n + 1))
     if [[ -n ${PICKED[$k]:-} ]]; then
-      printf '  %3d  %-8s %-16s -> %-14s %s\n' "$n" "${R_PROD[$k]}" "${R_VER[$k]}" "${R_FIX[$k]:--}" "${PLAN_DESC[$k]}"
+      printf '  %3d  %-8s %-16s -> %-14s %s\n' "$n" "$(disp_prod "${R_PROD[$k]}")" "${R_VER[$k]}" "${R_FIX[$k]:--}" "${PLAN_DESC[$k]}"
     fi
   done
   if (( ! ASSUME_YES )); then
@@ -971,7 +1279,7 @@ patch_node_binary() {  # a node binary inside an app (no folder of its own): swa
 }
 
 patch_firefox_manual() {
-  local k=$1 root=${R_ROOT[$1]} t=${R_FIX[$1]} rel arch name sha tmp
+  local k=$1 root=${R_ROOT[$1]} t=${R_FIX[$1]} rel arch name sha tmp e b
   rel=$t; [[ ${R_NOTE[$k]} == ESR* ]] && rel="${t}esr"
   case $(uname -m) in x86_64) arch=linux-x86_64 ;; aarch64|arm64) arch=linux-aarch64 ;; *) fail_item "$k" "unsupported CPU"; return ;; esac
   name=firefox-$rel.tar.xz
@@ -981,7 +1289,14 @@ patch_firefox_manual() {
   pkill -f "^$root/firefox" 2>/dev/null || true
   if fetch_verified "https://archive.mozilla.org/pub/firefox/releases/$rel/$arch/en-US/$name" "$tmp/$name" "$sha" \
      && mkdir "$tmp/new" && tar -xJf "$tmp/$name" -C "$tmp/new" --strip-components=1 --no-same-owner; then
-    if [[ -d $root/distribution ]]; then cp -a "$root/distribution" "$tmp/new/"; fi   # enterprise policies
+    # keep what Mozilla's release does not ship: enterprise policies (distribution/), the distro's
+    # launcher (/usr/bin/firefox -> /usr/lib/firefox/firefox.sh on Ubuntu 20.04) and similar files
+    for e in "$root"/* "$root"/.[!.]*; do
+      [[ -e $e || -L $e ]] || continue
+      b=${e##*/}
+      case $b in *.so|*.so.*|*.chk) continue ;; esac
+      [[ -e $tmp/new/$b || -L $tmp/new/$b ]] || cp -a "$e" "$tmp/new/"
+    done
     swap_in "$k" "$root" "$tmp/new"
   else
     fail_item "$k" "download/verify/extract of $name failed"
@@ -1168,6 +1483,239 @@ patch_python_rebuild() {
   if (( ${#dirs[@]} )) && refresh_certifi_dirs "${dirs[@]}"; then OUTCOME[$k]="${OUTCOME[$k]}; $CERTIFI_MSG"; fi
 }
 
+# ---- libraries, Bun and the litellm malware ----------------------------------
+run_as() {  # account dir extra-PATH command... -> runs it as that account in dir (clean env, proxies kept); output in RUN_OUT
+  local u=$1 dir=$2 pre=$3 home v; shift 3
+  local -a envs=() as=()
+  home=$(getent passwd "$u" | cut -d: -f6)
+  envs=("PATH=${pre:+$pre:}/usr/local/bin:/usr/bin:/bin" "HOME=${home:-/tmp}" "USER=$u" "LANG=C.UTF-8")
+  for v in http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY PIP_INDEX_URL npm_config_registry; do
+    if [[ -n ${!v:-} ]]; then envs+=("$v=${!v}"); fi
+  done
+  if [[ $EUID -eq 0 && $u != root ]]; then as=(runuser -u "$u" --); fi
+  RUN_OUT=$(timeout 900 "${as[@]}" env -i "${envs[@]}" env -C "$dir" "$@" 2>&1)
+}
+
+pip_cmd() {  # key pip-arguments... -> pip of that Python environment, as its owner
+  local k=$1; shift
+  local -a extra=()
+  if [[ $1 == install && ${R_PYMODE[$k]} == user ]]; then extra+=(--user); fi
+  if [[ ( $1 == install || $1 == uninstall ) && ${R_PYMODE[$k]} == system ]] && compgen -G '/usr/lib/python3*/EXTERNALLY-MANAGED' >/dev/null; then
+    extra+=(--break-system-packages)
+  fi
+  run_as "$(runas_for "$k")" / "" "${R_PY[$k]}" -m pip "$@" "${extra[@]}" --no-input --disable-pip-version-check
+}
+
+patch_pip() {  # Pillow / Brotli / LiteLLM: the fixed release, inside that exact Python environment
+  local k=$1 spec need=""
+  spec=$(lib_spec "$k")
+  case ${R_LIB[$k]} in pillow) need=3.11 ;; litellm) need=3.10 ;; esac
+  if [[ -n $need && -n ${R_PYVER[$k]:-} ]] && ver_lt "${R_PYVER[$k]}" "$need"; then
+    fail_item "$k" "${R_PROD[$k]} ${R_FIX[$k]} needs Python $need or newer - this environment runs Python ${R_PYVER[$k]} (move it to a newer Python)"; return
+  fi
+  if [[ -z ${R_PY[$k]} || ! -x ${R_PY[$k]} ]]; then fail_item "$k" "no Python interpreter found for ${R_ROOT[$k]}"; return; fi
+  if ! pip_cmd "$k" --version; then run_as "$(runas_for "$k")" / "" "${R_PY[$k]}" -m ensurepip --upgrade; fi   # e.g. uv venvs ship without pip
+  if pip_cmd "$k" install --upgrade "$spec"; then ok_item "$k" "pip install -U '$spec' (was ${R_VER[$k]})"
+  else fail_item "$k" "pip failed: $(tail -n 2 <<<"$RUN_OUT" | tr '\n' ' ')"; fi
+}
+
+quarantine_ioc() {  # site-packages -> its malicious litellm startup files go into a root-only archive; sets IOC_MSG
+  local sp=$1 f q
+  local -a found=()
+  if [[ -f $sp/cook.pth ]] && is_litellm_ioc "$sp/cook.pth"; then
+    found+=("$sp/cook.pth"); [[ -f $sp/cook.py ]] && found+=("$sp/cook.py")
+    for f in "$sp"/__pycache__/cook.*.pyc; do [[ -f $f ]] && found+=("$f"); done
+  fi
+  if [[ -f $sp/sitecustomize.py ]] && is_litellm_ioc "$sp/sitecustomize.py"; then
+    found+=("$sp/sitecustomize.py")
+    for f in "$sp"/__pycache__/sitecustomize.*.pyc; do [[ -f $f ]] && found+=("$f"); done
+  fi
+  IOC_MSG="no malicious startup files left in site-packages"
+  (( ${#found[@]} )) || return 0
+  mkdir -p "$BACKUP_DIR/quarantine" && chmod 700 "$BACKUP_DIR" "$BACKUP_DIR/quarantine"
+  q=$BACKUP_DIR/quarantine/litellm-malware-$(tr '/' '_' <<<"${sp#/}")-$STAMP.tar.gz
+  if tar -czPf "$q" "${found[@]}" 2>>"$LOG" && chmod 600 "$q" && rm -f "${found[@]}"; then
+    IOC_MSG="${#found[@]} malicious startup file(s) quarantined in $q"
+  else IOC_MSG="could not quarantine ${found[*]}"; return 1; fi
+}
+
+stop_litellm_backdoor() {  # kills whatever holds the backdoor's lock file and blocks its server; sets STOP_MSG
+  local p fd pids=""
+  for p in /proc/[0-9]*; do
+    for fd in "$p"/fd/*; do
+      if [[ $(readlink "$fd" 2>/dev/null) == /tmp/remote_code_loader.lock ]]; then kill -9 "${p#/proc/}" 2>/dev/null && pids+=" ${p#/proc/}"; break; fi
+    done
+  done
+  rm -f /tmp/remote_code_loader.lock
+  if ! grep -qE '^[^#]*[[:space:]]www\.litellm\.dev([[:space:]]|$)' /etc/hosts 2>/dev/null; then
+    cp -a /etc/hosts "$BACKUP_DIR/hosts-$STAMP" 2>/dev/null
+    printf '0.0.0.0 www.litellm.dev litellm.dev   # vulnpatch: litellm 1.107.0 malware server\n' >>/etc/hosts
+  fi
+  STOP_MSG="backdoor stopped${pids:+ (PID$pids)}, www.litellm.dev blocked in /etc/hosts"
+}
+
+patch_ioc() {  # startup files left by litellm 1.107.0 (even after the package itself is gone)
+  local k=$1
+  if quarantine_ioc "${R_ROOT[$k]}"; then
+    stop_litellm_backdoor
+    ok_item "$k" "$IOC_MSG; $STOP_MSG - ROTATE every credential used on this machine (cloud, SSH, API keys, tokens)"
+  else fail_item "$k" "$IOC_MSG"; fi
+}
+
+patch_litellm() {  # the malicious release: startup files out, package and cached wheel out, clean release in
+  local k=$1 sp=${R_ROOT[$1]} now
+  quarantine_ioc "$sp" || { fail_item "$k" "$IOC_MSG"; return; }
+  stop_litellm_backdoor
+  pip_cmd "$k" uninstall -y litellm
+  rm -rf "$sp/litellm" "$sp"/litellm-*.dist-info 2>/dev/null          # whatever the uninstall left behind
+  pip_cmd "$k" cache remove litellm
+  if pip_cmd "$k" install --upgrade "$LITELLM_SPEC"; then
+    now=$(sed -n 's/^Version: *//p' "$sp"/litellm-*.dist-info/METADATA 2>/dev/null | head -n1)
+    ok_item "$k" "malicious litellm ${R_VER[$k]} removed, clean ${now:-litellm} installed; $IOC_MSG; $STOP_MSG - ROTATE every credential used on this machine"
+  else
+    fail_item "$k" "malicious litellm removed, clean reinstall failed: $(tail -n 2 <<<"$RUN_OUT" | tr '\n' ' ') - $IOC_MSG; ROTATE credentials"
+  fi
+}
+
+find_npm() {  # account -> an npm that account can run: the system one, its own Node managers, then any scanned Node
+  local u=$1 home c k
+  home=$(getent passwd "$u" | cut -d: -f6)
+  for c in /usr/bin/npm /usr/local/bin/npm; do if [[ -x $c ]]; then echo "$c"; return 0; fi; done
+  for c in $(ls -d "$home"/.nvm/versions/node/*/bin/npm "$home"/.volta/bin/npm "$home"/.local/share/fnm/node-versions/*/installation/bin/npm 2>/dev/null | sort -rV); do
+    if [[ -x $c ]]; then echo "$c"; return 0; fi
+  done
+  for k in "${KEYS[@]}"; do if [[ ${R_PROD[$k]} == Node.js && -x ${R_ROOT[$k]}/bin/npm ]]; then echo "${R_ROOT[$k]}/bin/npm"; return 0; fi; done
+  return 1
+}
+
+dep_field() {  # package.json name -> the section that lists it directly (empty: only a sub-dependency)
+  if have python3; then
+    python3 -I -c 'import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+for f in ("dependencies", "devDependencies", "optionalDependencies"):
+    if sys.argv[2] in (d.get(f) or {}): print(f); break' "$1" "$2" 2>/dev/null
+  elif grep -qE "\"$2\"[[:space:]]*:" "$1"; then echo dependencies; fi
+}
+
+patch_npm() {  # next / sharp: the fixed release inside the project, with the project's own package manager
+  local k=$1 proj=${R_ROOT[$1]} name=${R_LIB[$1]} spec range u npm dir pm=npm tool="" bak field now rc
+  local -a files=() cmd=()
+  spec=$(npm_spec "$k"); range=${spec#*@}; u=$(runas_for "$k")
+  npm=$(find_npm "$u") || { fail_item "$k" "no npm found for $u - run in the project: npm install $spec"; return; }
+  dir=${npm%/*}
+  [[ -f $proj/pnpm-lock.yaml ]] && pm=pnpm
+  [[ -f $proj/yarn.lock ]] && pm=yarn
+  if [[ $pm != npm ]]; then
+    if [[ -x $dir/$pm ]]; then tool=$dir/$pm; else tool=$(command -v "$pm" 2>/dev/null); fi
+    [[ -n $tool ]] || { fail_item "$k" "this project uses $pm, which is not installed - run in the project: $pm add $spec"; return; }
+  fi
+  mapfile -t files < <(cd "$proj" && ls package.json package-lock.json npm-shrinkwrap.json yarn.lock pnpm-lock.yaml 2>/dev/null)
+  mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"
+  bak=$BACKUP_DIR/$(tr '/' '_' <<<"${proj#/}")-npm-$STAMP.tar.gz
+  tar -czf "$bak" -C "$proj" "${files[@]}" 2>>"$LOG" || { fail_item "$k" "could not back up package.json - nothing changed"; return; }
+  field=$(dep_field "$proj/package.json" "$name")
+  if [[ -n $field ]]; then              # a direct dependency: update it where it is listed
+    case $pm in
+      npm)  cmd=("$npm" install "$spec" --no-audit --no-fund) ;;
+      *)    cmd=("$tool" add "$spec") ;;
+    esac
+    if [[ $field == devDependencies ]]; then case $pm in yarn) cmd+=(--dev) ;; *) cmd+=(--save-dev) ;; esac; fi
+    run_as "$u" "$proj" "$dir" "${cmd[@]}"; rc=$?
+  else                                  # pulled in by another package (sharp via next): pin it with an override
+    case $pm in npm) field=overrides.$name ;; yarn) field=resolutions.$name ;; pnpm) field=pnpm.overrides.$name ;; esac
+    run_as "$u" "$proj" "$dir" "$npm" pkg set "$field=$range"; rc=$?
+    if (( rc == 0 )); then
+      if [[ $pm == npm ]]; then run_as "$u" "$proj" "$dir" "$npm" install --no-audit --no-fund; else run_as "$u" "$proj" "$dir" "$tool" install; fi
+      rc=$?
+    fi
+  fi
+  now=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$proj/node_modules/$name/package.json" 2>/dev/null | head -n1)
+  if (( rc == 0 )) && [[ -n $now ]] && ! ver_lt "$now" "${R_FIX[$k]}"; then
+    ok_item "$k" "$pm: $name ${R_VER[$k]} -> $now (package.json backup: $bak)"
+  else
+    fail_item "$k" "$pm could not update $name (now ${now:-?}): $(tail -n 2 <<<"$RUN_OUT" | tr '\n' ' ') - backup: $bak"
+  fi
+}
+
+patch_bun() {  # Bun's own release for this CPU and libc, SHA-256 checked, swapped for the binary in place
+  local k=$1 bin=${R_PATHS[$1]%%;*} a name zip tmp sha bak base="https://github.com/oven-sh/bun/releases/download/bun-v$BUN_FIX"
+  case $(uname -m) in x86_64) a=x64 ;; aarch64|arm64) a=aarch64 ;; *) fail_item "$k" "unsupported CPU $(uname -m)"; return ;; esac
+  name=bun-linux-$a
+  if ldd --version 2>&1 | grep -qi musl; then name+=-musl; fi
+  if [[ $a == x64 ]] && ! grep -qw avx2 /proc/cpuinfo; then name+=-baseline; fi   # older CPUs
+  zip=$name.zip
+  have python3 || { fail_item "$k" "python3 is needed to unpack the Bun release"; return; }
+  tmp=$(mktemp -d /var/tmp/vulnpatch-bun.XXXXXX) || { fail_item "$k" "no temp dir"; return; }
+  sha=$(curl -fsSL "$base/SHASUMS256.txt" 2>>"$LOG" | awk -v f="$zip" '$2 == f {print $1}')
+  if [[ -n $sha ]] && fetch_verified "$base/$zip" "$tmp/$zip" "$sha" && unzip_keep_modes "$tmp/$zip" "$tmp" 2>>"$LOG" && [[ -x $tmp/$name/bun ]]; then
+    if bak=$(archive_tree "$bin") && cp "$tmp/$name/bun" "$bin.vulnpatch-new" && chown --reference="$bin" "$bin.vulnpatch-new" \
+       && chmod --reference="$bin" "$bin.vulnpatch-new" && mv -f "$bin.vulnpatch-new" "$bin"; then
+      ok_item "$k" "bun ${R_VER[$k]} -> $BUN_FIX (backup: $bak)"
+    else rm -f "$bin.vulnpatch-new"; fail_item "$k" "could not replace $bin"; fi
+  else fail_item "$k" "download/verify of $zip failed"; fi
+  rm -rf "$tmp"
+}
+
+patch_firefox_pkg() {  # after the package update: if the distro had no fixed build, Mozilla's release goes in its place
+  local k=$1 cur
+  cur=$(sed -n 's/^Version=//p' "${R_ROOT[$k]}/application.ini" 2>/dev/null | head -n1)
+  if [[ -n $cur ]] && ! ver_lt "$cur" "${R_FIX[$k]}"; then ok_item "$k" "firefox package updated to $cur"; return; fi
+  say "    the package manager has no Firefox ${R_FIX[$k]} for ${PRETTY_NAME:-this release} (still ${cur:-?}) - Mozilla's build goes in its place"
+  patch_firefox_manual "$k"
+}
+
+patch_java() {  # adds the missing eMudhra fingerprints to the block list that JVM reads (after any package update)
+  local k=$1 root=${R_ROOT[$1]} f n fp bak="" made=0
+  local -a missing=()
+  f=$(java_blockfile "$root"); n=$(java_fp_count "$f")
+  if (( n == ${#EMUDHRA_FPS[@]} )); then ok_item "$k" "eMudhra certificates already blocked (package update)"; return; fi
+  for fp in "${EMUDHRA_FPS[@]}"; do grep -qi "^$fp" "$f" 2>/dev/null || missing+=("$fp"); done
+  if [[ -e $f ]]; then
+    bak=$(archive_tree "$(readlink -f "$f")") || { fail_item "$k" "could not back up $f - nothing changed"; return; }
+  else
+    { mkdir -p "${f%/*}" && printf 'Algorithm=SHA-256\n' >"$f"; } || { fail_item "$k" "cannot create $f"; return; }
+    chown --reference="${f%/*}" "$f" 2>/dev/null; made=1
+  fi
+  if [[ -s $f && -n $(tail -c1 "$f") ]]; then printf '\n' >>"$f"; fi   # the list must not run into the last line
+  printf '%s\n' "${missing[@]}" >>"$f" || { fail_item "$k" "cannot write $f"; return; }
+  # no block list at all: write it under both names (JDK 8-15 read blacklisted.certs, newer ones blocked.certs)
+  if (( made )) && [[ ! -e ${f%/*}/blacklisted.certs ]]; then cp -p "$f" "${f%/*}/blacklisted.certs"; fi
+  n=$(java_fp_count "$f")
+  if (( n == ${#EMUDHRA_FPS[@]} )); then ok_item "$k" "${#missing[@]} eMudhra certificates added to $f${bak:+ (backup: $bak)} - running Java apps need a restart"
+  else fail_item "$k" "block list still incomplete ($n/${#EMUDHRA_FPS[@]}) in $f"; fi
+}
+
+ca_g3_trusted() {  # bundle -> true while emSign ECC Root CA - G3 is in it
+  openssl crl2pkcs7 -nocrl -certfile "$1" 2>/dev/null | openssl pkcs7 -print_certs -noout 2>/dev/null | grep -qiE 'CN ?= ?emSign ECC Root CA - G3'
+}
+
+patch_ca() {  # after the ca-certificates update: if this release has no fixed package, the root is distrusted directly
+  local k=$1 bundle=${R_ROOT[$1]} conf=/etc/ca-certificates.conf name="" tmp c dir
+  if ! ca_g3_trusted "$bundle"; then ok_item "$k" "emSign ECC Root CA - G3 removed by the ca-certificates update"; return; fi
+  mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"
+  if [[ -f $conf ]] && have update-ca-certificates; then         # Debian / Ubuntu: deselect it in ca-certificates.conf
+    name=$(cd /usr/share/ca-certificates 2>/dev/null && ls mozilla/*emSign_ECC_Root_CA_-_G3* 2>/dev/null | head -n1)
+    if [[ -z $name ]]; then fail_item "$k" "emSign ECC Root CA - G3 is trusted but not from /usr/share/ca-certificates (look in /usr/local/share/ca-certificates)"; return; fi
+    cp -a "$conf" "$BACKUP_DIR/ca-certificates.conf-$STAMP"
+    if grep -qxF "$name" "$conf"; then sed -i "s|^$name\$|!$name|" "$conf"
+    elif ! grep -qxF "!$name" "$conf"; then printf '!%s\n' "$name" >>"$conf"; fi
+    update-ca-certificates --fresh >>"$LOG" 2>&1 || warn "update-ca-certificates reported errors (see $LOG)"
+  elif have update-ca-trust; then                                 # RHEL / Fedora: copy it into the block list
+    dir=/etc/pki/ca-trust/source/blocklist; [[ -d $dir ]] || dir=/etc/pki/ca-trust/source/blacklist
+    mkdir -p "$dir"; tmp=$(mktemp -d /var/tmp/vulnpatch-ca.XXXXXX)
+    awk -v d="$tmp" '/BEGIN CERTIFICATE/{n++} n{print > (d "/c" n ".pem")}' "$bundle"
+    for c in "$tmp"/c*.pem; do
+      if openssl x509 -noout -subject -in "$c" 2>/dev/null | grep -qiE 'CN ?= ?emSign ECC Root CA - G3'; then cp "$c" "$dir/emSign_ECC_Root_CA_-_G3.pem"; fi
+    done
+    rm -rf "$tmp"
+    update-ca-trust extract >>"$LOG" 2>&1 || warn "update-ca-trust reported errors (see $LOG)"
+  else
+    fail_item "$k" "neither update-ca-certificates nor update-ca-trust exists here"; return
+  fi
+  if ca_g3_trusted "$bundle"; then fail_item "$k" "emSign ECC Root CA - G3 is still in $bundle after distrusting it"
+  else ok_item "$k" "no fixed ca-certificates for ${PRETTY_NAME:-this release} - emSign ECC Root CA - G3 distrusted (backup: $BACKUP_DIR)"; fi
+}
+
 run_packages() {
   (( ${#PKGS[@]} )) || return 0
   local p cand todo=() holds=()
@@ -1213,10 +1761,149 @@ execute_plan() {
                 if [[ ${R_PROD[$k]} == PHP ]]; then patch_php_rebuild "$k"; else patch_python_rebuild "$k"; fi ;;
       certifi)  step "Python ${R_VER[$k]} certifi  ${R_ROOT[$k]}"; patch_certifi "$k" ;;
       venvs)    step "Python virtualenvs (${#VENV_ROOTS[@]}) certifi"; patch_venvs "$k" ;;
+      java)     step "Java ${R_VER[$k]} eMudhra block list  ${R_ROOT[$k]}"; patch_java "$k" ;;
+      ioc)      step "LiteLLM MALWARE  ${R_ROOT[$k]}"; patch_ioc "$k" ;;
+      litellm)  step "LiteLLM ${R_VER[$k]} (MALICIOUS RELEASE)  ${R_ROOT[$k]}"; patch_litellm "$k" ;;
+      pip)      step "${R_PROD[$k]} ${R_VER[$k]} -> ${R_FIX[$k]}  ${R_ROOT[$k]}"; patch_pip "$k" ;;
+      npm)      step "${R_PROD[$k]} ${R_VER[$k]} -> ${R_FIX[$k]}  ${R_ROOT[$k]}"; patch_npm "$k" ;;
+      bun)      step "Bun ${R_VER[$k]} -> $BUN_FIX  ${R_ROOT[$k]}"; patch_bun "$k" ;;
+      ca)       step "OS trust store  ${R_ROOT[$k]}"; patch_ca "$k" ;;
+      firefox-pkg) step "Firefox ${R_VER[$k]} -> ${R_FIX[$k]}  ${R_ROOT[$k]}"; patch_firefox_pkg "$k" ;;
     esac
   done
   [[ -n ${CERTIFI_TMP:-} ]] && rm -rf "$CERTIFI_TMP"
   return 0
+}
+
+why_not_patched() {  # key -> the reason a picked copy is still vulnerable (for the screen and the report)
+  local k=$1 why=${OUTCOME[$1]:-} p
+  for p in ${PLAN_PKGS[$k]:-}; do if [[ -n ${NOTE_PKG[$p]:-} ]]; then why+="${why:+; }$p: ${NOTE_PKG[$p]}"; fi; done
+  if [[ -z $why && -n ${PLAN_PKGS[$k]:-} ]]; then
+    why="the package manager offers no fixed version of ${PLAN_PKGS[$k]}"
+    if [[ ${ID:-} == ubuntu && ${VERSION_ID:-} == 20.04 ]]; then why+=" (Ubuntu 20.04 standard support has ended - fixes ship through Ubuntu Pro/ESM)"; fi
+  fi
+  printf '%s' "${why:-the fix ran but the copy still reports a vulnerable version}"
+}
+
+# ---- Excel-ready CSV report -------------------------------------------------
+REPORT_ROWS=()
+
+host_info() {  # name, IP and MAC of the interface that carries the default route
+  local dev
+  dev=$(ip route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
+  if [[ -z $dev ]]; then dev=$(ls /sys/class/net 2>/dev/null | grep -vx lo | head -n1); fi
+  HOST_NAME=$(hostname -f 2>/dev/null || hostname)
+  HOST_MAC=$(cat "/sys/class/net/$dev/address" 2>/dev/null)
+  HOST_IP=$(ip -4 -o addr show dev "$dev" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+  RUN_AT=$(date '+%Y-%m-%d %H:%M:%S')
+}
+
+csv() {  # fields -> one CSV line: every field quoted, quotes doubled
+  local f out="" sep=""
+  for f in "$@"; do f=${f//\"/\"\"}; out+="$sep\"$f\""; sep=,; done
+  printf '%s' "$out"
+}
+
+add_report_row() {  # product before fixed after result action error location method note
+  REPORT_ROWS+=("$(csv "$HOST_NAME" "${HOST_IP:-}" "${HOST_MAC:-}" "${PRETTY_NAME:-Linux}" \
+    "vulnpatch-linux.sh $SCRIPT_VERSION${ARGS_TXT:+ $ARGS_TXT}" "$RUN_AT" "$MODE" "$@")")
+}
+
+add_current_rows() {  # [skip-plan] -> one row per copy as found now (scan / plan mode, or the copies outside the plan)
+  local k res act after
+  (( ${#KEYS[@]} )) || return 0
+  for k in "${KEYS[@]}"; do
+    if [[ ${1:-} == skip-plan && -n ${IN_PLAN[$k]:-} ]]; then continue; fi
+    res=${R_STATUS[$k]}; act=${R_ACTION[$k]:--}; after=""
+    if [[ ${1:-} == skip-plan ]]; then
+      after=${R_VER[$k]}
+      case $res in PATCHED) res="ALREADY PATCHED" ;; "NOT FOUND") after="-" ;; *) res="NOT SELECTED (--only)" ;; esac
+    fi
+    add_report_row "${R_PROD[$k]}" "${R_VER[$k]}" "${R_FIX[$k]:--}" "$after" "$res" "$act" "" "${R_ROOT[$k]}" "${R_METHOD[$k]}" "${R_NOTE[$k]}"
+  done
+}
+
+report_owner() { if [[ -n ${SUDO_USER:-} ]]; then echo "$SUDO_USER"; else id -un; fi; }   # who ran it, also under sudo
+
+report_dir() {  # that person's Desktop (else Downloads, else home); --report overrides
+  local u home d x
+  if [[ -n $REPORT_PATH && $REPORT_PATH != *.csv ]]; then echo "$REPORT_PATH"; return 0; fi
+  u=$(report_owner); home=$(getent passwd "$u" | cut -d: -f6); home=${home:-${HOME:-/root}}
+  if have xdg-user-dir; then   # the real (possibly translated) folder names, e.g. ~/Schreibtisch
+    for x in DESKTOP DOWNLOAD; do
+      if [[ $EUID -eq 0 && $u != root ]]; then d=$(runuser -u "$u" -- env HOME="$home" xdg-user-dir "$x" 2>/dev/null)
+      else d=$(HOME=$home xdg-user-dir "$x" 2>/dev/null); fi
+      if [[ -n $d && $d != "$home" && -d $d ]]; then echo "$d"; return 0; fi
+    done
+  fi
+  for d in "$home/Desktop" "$home/Downloads" "$home"; do if [[ -d $d ]]; then echo "$d"; return 0; fi; done
+  echo "$LOGDIR/reports"
+}
+
+# Containers and virtual machines are separate systems: their disks are images this scan cannot look
+# into. They are listed so none is missed - run the script inside each of them.
+INNER=()
+scan_inner_systems() {
+  local c home re='^"(.+)" \{' u
+  u=$(report_owner); home=$(getent passwd "$u" | cut -d: -f6)
+  INNER=()
+  if have docker; then
+    while IFS= read -r c; do if [[ -n $c ]]; then INNER+=("Docker container|$c|rebuild its image with patched packages (changes inside a container are lost)"); fi
+    done < <(timeout 20 docker ps -a --format '{{.Names}} ({{.Image}}, {{.Status}})' 2>/dev/null)
+  fi
+  if have podman; then
+    while IFS= read -r c; do if [[ -n $c ]]; then INNER+=("Podman container|$c|rebuild its image with patched packages (changes inside a container are lost)"); fi
+    done < <(timeout 20 podman ps -a --format '{{.Names}} ({{.Image}}, {{.Status}})' 2>/dev/null)
+  fi
+  if have lxc && [[ -S /var/snap/lxd/common/lxd/unix.socket || -S /var/lib/lxd/unix.socket ]]; then
+    while IFS= read -r c; do if [[ -n $c ]]; then INNER+=("LXD container/VM|$c|run this script inside it (lxc exec $c -- bash)"); fi
+    done < <(timeout 20 lxc list -c n --format csv 2>/dev/null)
+  fi
+  if have virsh; then
+    while IFS= read -r c; do if [[ -n $c ]]; then INNER+=("KVM/libvirt VM|$c|run this script inside the VM"); fi
+    done < <(timeout 20 virsh -c qemu:///system list --all --name 2>/dev/null)
+  fi
+  if have VBoxManage; then   # VirtualBox VMs belong to a user
+    while IFS= read -r c; do if [[ $c =~ $re ]]; then INNER+=("VirtualBox VM|${BASH_REMATCH[1]}|run this script inside the VM"); fi
+    done < <(if [[ $EUID -eq 0 && $u != root ]]; then timeout 20 runuser -u "$u" -- VBoxManage list vms; else timeout 20 VBoxManage list vms; fi 2>/dev/null)
+  fi
+  if [[ -n $home && -f $home/.vmware/inventory.vmls ]]; then
+    while IFS= read -r c; do if [[ -n $c ]]; then INNER+=("VMware VM|$c|run this script inside the VM"); fi
+    done < <(sed -n 's/^vmlist[0-9]*\.config = "\(.*\.vmx\)"$/\1/p' "$home/.vmware/inventory.vmls")
+  fi
+}
+
+show_inner() {
+  (( ${#INNER[@]} )) || return 0
+  local e ik iname ihow
+  printf '\n  %sNOT SCANNED - separate systems inside this machine (%d):%s\n' "$YEL" "${#INNER[@]}" "$RST"
+  for e in "${INNER[@]}"; do IFS='|' read -r ik iname ihow <<<"$e"; printf '    %s- %s: %s  ->  %s%s\n' "$YEL" "$ik" "$iname" "$ihow" "$RST"; done
+}
+
+write_report() {  # one report per machine (Desktop): a re-run updates it; rows of other hosts in a shared file are kept
+  local f u state=created tmp e ik iname ihow
+  if [[ $REPORT_PATH == *.csv ]]; then f=$REPORT_PATH; else f=$(report_dir)/vulnpatch-report-$(hostname -s).csv; fi
+  mkdir -p "$(dirname "$f")" 2>/dev/null || { warn "cannot create $(dirname "$f") - report not written"; return 0; }
+  if (( ${#INNER[@]} )); then
+    for e in "${INNER[@]}"; do
+      IFS='|' read -r ik iname ihow <<<"$e"
+      add_report_row "$ik" - - - "NOT SCANNED" "$ihow" "separate system - its disk cannot be scanned from this machine" "$iname" - ""
+    done
+  fi
+  [[ -f $f ]] && state=updated
+  tmp=$f.vulnpatch-tmp
+  if { printf '\xEF\xBB\xBF'
+       printf '%s\r\n' "$(csv Host "IP address" "MAC address" OS Script "Run at" Mode Product "Version before" "Fixed in" \
+         "Version after" Result Action "Error / reason" Location "Install method" Note)"
+       if [[ -f $f ]]; then tail -n +2 "$f" | awk -v h="\"$HOST_NAME\"," 'index($0, h) != 1 && NF'; fi
+       if (( ${#REPORT_ROWS[@]} )); then printf '%s\r\n' "${REPORT_ROWS[@]}"; fi
+     } >"$tmp" 2>/dev/null && mv -f "$tmp" "$f"; then
+    u=$(report_owner)
+    if [[ $EUID -eq 0 && $u != root ]]; then chown "$u": "$f" 2>/dev/null; fi
+    printf '\n  %sExcel report %s: %s%s\n' "$CYN" "$state" "$f" "$RST"
+  else
+    rm -f "$tmp"; warn "cannot write $f - report not written"
+  fi
 }
 
 verify() {  # compares the re-scan with the copies found before patching (same numbers as the plan)
@@ -1240,15 +1927,22 @@ verify() {  # compares the re-scan with the copies found before patching (same n
     elif [[ -z ${PICKED[$k]:-} ]]; then
       res="NOT SELECTED"; col=$YEL; n_skip=$((n_skip + 1))
     elif [[ $after_st == REVIEW ]]; then
-      res="REVIEW"; col=$YEL; n_rev=$((n_rev + 1))
-      details+=("$i  ${B_PROD[$k]} ${B_VER[$k]} (${B_ROOT[$k]}): ${OUTCOME[$k]:-} | ${A_NOTE[$mk]:-}")
+      res="REVIEW"; col=$YEL; n_rev=$((n_rev + 1)); why="${OUTCOME[$k]:-} | ${A_NOTE[$mk]:-}"
+      details+=("$i  ${B_PROD[$k]} ${B_VER[$k]} (${B_ROOT[$k]}): $why")
     else
-      res="STILL VULNERABLE"; col=$RED; n_bad=$((n_bad + 1)); why=${OUTCOME[$k]:-}
-      if [[ -z $why && ${PLAN_KIND[$k]} == pkg ]]; then why="no fixed version in the configured repositories (or blocked/held)"; fi
+      res="STILL VULNERABLE"; col=$RED; n_bad=$((n_bad + 1)); why=$(why_not_patched "$k")
       details+=("$i  ${B_PROD[$k]} ${B_VER[$k]} (${B_ROOT[$k]}): $why${A_NOTE[$mk]:+ | now: ${A_NOTE[$mk]}}")
+      why+="${A_NOTE[$mk]:+ | now: ${A_NOTE[$mk]}}"
     fi
-    printf '  %3s  %s%-16s%s %-8s %-16s -> %-16s %s\n' "$i" "$col" "$res" "$RST" "${B_PROD[$k]}" \
+    printf '  %3s  %s%-16s%s %-8s %-16s -> %-16s %s\n' "$i" "$col" "$res" "$RST" "$(disp_prod "${B_PROD[$k]}")" \
       "${B_VER[$k]}" "$after_ver" "$(short_loc "${B_ROOT[$k]}")"
+    case $res in PATCHED|REMOVED) why="" ;; "NOT SELECTED") why="not selected in this run" ;; esac
+    add_report_row "${B_PROD[$k]}" "${B_VER[$k]}" "${B_FIX[$k]}" "$after_ver" "$res" "${B_DESC[$k]}" "$why" \
+      "${B_ROOT[$k]}" "${B_METHOD[$k]}" "${OUTCOME[$k]:-}"
+  done
+  for k in "${EXTERNAL_ORDER[@]}"; do
+    add_report_row "${B_PROD[$k]}" "${B_VER[$k]}" "${B_FIX[$k]}" "${A_VER[${B_MK[$k]}]:-${B_VER[$k]}}" "NOT PATCHED" "-" \
+      "${B_DESC[$k]}" "${B_ROOT[$k]}" "${B_METHOD[$k]}" "${B_NOTE[$k]}"
   done
   printf '  %s\n' "$LINE"
   printf '  Result: %s%d patched%s, %s%d still vulnerable%s, %s%d not selected%s, %d review (distro packages)\n' \
@@ -1267,7 +1961,7 @@ restart_check() {   # processes still running the old (replaced/deleted) binarie
   for p in /proc/[0-9]*; do
     exe=$(readlink "$p/exe" 2>/dev/null) || continue
     [[ $exe == *" (deleted)" ]] || continue
-    case ${exe##*/} in php*|node*|python3*|chrome*|msedge*|brave*|firefox*) hits+=("PID ${p#/proc/}  ${exe% (deleted)}") ;; esac
+    case ${exe##*/} in php*|node*|python3*|java|bun|chrome*|msedge*|brave*|firefox*) hits+=("PID ${p#/proc/}  ${exe% (deleted)}") ;; esac
   done
   if (( ${#hits[@]} )); then
     printf '\n  %sRestart needed - these processes still run the old vulnerable code:%s\n' "$YEL" "$RST"
@@ -1290,33 +1984,40 @@ printf '  scanning: %s%s\n' "${ROOTS[*]}" "$( (( NO_EXEC )) && echo '  (no-exec 
 
 step "Detection: every copy on the machine"
 scan_machine
+host_info
+scan_inner_systems
 RESULT_BAD=0
 if [[ $MODE == scan ]]; then
   report
+  show_inner
   JSON_OUT=${JSON_OUT:-/tmp/vulnscan-$(hostname -s)-$STAMP.json}
   write_json "$JSON_OUT"
   printf '  JSON report: %s   (%ss)\n' "$JSON_OUT" "$(( $(date +%s) - START ))"
-  if [[ -d /var/lib/docker || -d /var/lib/containerd || -d /var/lib/containers ]]; then
-    printf '  %snote: container storage present - images are not scanned here; use trivy/grype or rebuild images%s\n' "$DIM" "$RST"
-  fi
+  add_current_rows; write_report
   (( RESULT_BAD )) && exit 1
   exit 0
 fi
 report_brief
+show_inner
 
 build_plan
 sort_plan
 for k in "${DISPLAY_ORDER[@]}"; do      # remember each copy, to compare with the re-scan after patching
   B_MK[$k]=$(match_key "$k"); B_VER[$k]=${R_VER[$k]}; B_PROD[$k]=${R_PROD[$k]}
   B_ROOT[$k]=${R_ROOT[$k]}; B_METHOD[$k]=${R_METHOD[$k]}
+  B_FIX[$k]=${R_FIX[$k]:--}; B_DESC[$k]=${PLAN_DESC[$k]}; B_NOTE[$k]=${R_NOTE[$k]}
 done
-if (( ${#PLAN_ORDER[@]} == 0 )); then step "Nothing to patch - every copy found is already patched"; exit 0; fi
+if (( ${#PLAN_ORDER[@]} == 0 )); then
+  step "Nothing to patch - every copy found is already patched"
+  add_current_rows; write_report; exit 0
+fi
 step "Patch plan"
 print_plan
 
 if [[ $MODE == plan ]]; then
   printf '\n  Nothing was changed. To patch: run the same command again with --apply\n'
-  printf '  It will ask which numbers to patch (e.g. all | 1,3,5-7 | php,node), or pass --pick to choose up front.\n\n'
+  printf '  It will ask which numbers to patch (e.g. all | 1,3,5-7 | php,node), or pass --pick to choose up front.\n'
+  add_current_rows; write_report; printf '\n'
   exit 1
 fi
 (( ${#PICK_ORDER[@]} )) || exit 1
@@ -1326,6 +2027,7 @@ mkdir -p "$LOGDIR"
 LOG=$LOGDIR/vulnpatch-$STAMP.log
 exec > >(tee -a "$LOGDIR/vulnpatch-$STAMP.console.log") 2>&1
 write_json "$LOGDIR/before-$STAMP.json"
+add_current_rows skip-plan     # report rows for the copies that needed nothing (taken before the re-scan)
 
 step "Patching"
 execute_plan
@@ -1337,8 +2039,9 @@ write_json "$LOGDIR/after-$STAMP.json"
 STILL_BAD=0
 verify
 restart_check
-printf '\n  Logs: %s/vulnpatch-%s*.log   scans: before-%s.json / after-%s.json   (%s min)\n\n' \
+printf '\n  Logs: %s/vulnpatch-%s*.log   scans: before-%s.json / after-%s.json   (%s min)\n' \
   "$LOGDIR" "$STAMP" "$STAMP" "$STAMP" "$(( ($(date +%s) - START) / 60 ))"
+write_report; printf '\n'
 (( STILL_BAD )) && exit 1
 exit 0
 }
